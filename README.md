@@ -5,7 +5,28 @@
 
 Поддерживаемые форматы на входе: PDF, JPG/JPEG, PNG, BMP, GIF, TIFF, WEBP, TXT.
 
-## Установка
+## Веб-версия (сервер / Docker)
+
+В репозитории есть `Dockerfile` — платформа соберёт и запустит веб-версию (`app.py`, Streamlit)
+автоматически. Приложение слушает `0.0.0.0` и порт из переменной окружения `PORT`
+(по умолчанию **8501**).
+
+```bash
+docker build -t pdf-app .
+docker run -p 8501:8501 pdf-app          # открыть http://localhost:8501
+```
+
+Без Docker:
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py --server.address 0.0.0.0 --server.port 8501
+```
+
+В веб-версии те же три вкладки: объединить, разделить, редактор.
+Результат скачивается кнопкой «⬇ Скачать» (при разделении на несколько файлов — ZIP-архивом).
+
+## Десктопная версия — установка
 
 Нужен Python 3.9+.
 
@@ -19,7 +40,7 @@ pip install -r requirements.txt
 pip install tkinterdnd2
 ```
 
-## Запуск
+## Десктопная версия — запуск
 
 ```bash
 python merge_gui.py

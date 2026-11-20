@@ -1,0 +1,6 @@
+.git
+screenshots
+__pycache__
+*.pyc
+.venv
+venv
