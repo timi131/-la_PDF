@@ -484,12 +484,39 @@ def make_stamp_png(kind, params):
     return stp.to_png_bytes(img)
 
 
+def dadata_key():
+    """Ключ из текущей сессии (введён в приложении) или из переменной окружения сервера."""
+    return ss.get("dadata_key") or orgdata.api_key()
+
+
+def save_user_key():
+    """Проверяет введённый ключ тестовым запросом и сохраняет его только в этой сессии."""
+    key = (ss.get("dadata_key_input") or "").strip()
+    ss.pop("key_msg", None)
+    if not key:
+        ss.key_msg = ("error", "Вставьте ключ.")
+        return
+    try:
+        orgdata.find_by_inn("7707083893", key=key)   # тестовый запрос (ИНН ПАО Сбербанк)
+    except orgdata.OrgLookupError as e:
+        ss.key_msg = ("error", str(e))
+        return
+    ss.dadata_key = key
+    ss.dadata_key_input = ""
+    ss.key_msg = ("success", "Ключ работает и сохранён до закрытия вкладки.")
+
+
+def forget_user_key():
+    ss.pop("dadata_key", None)
+    ss.key_msg = ("info", "Ключ удалён из сессии.")
+
+
 def org_lookup():
     """Заполняет поля печати и подписи реквизитами по ИНН (DaData)."""
     ss.pop("org_details", None)
     ss.pop("org_error", None)
     try:
-        item = orgdata.find_by_inn(ss.get("org_inn", ""))
+        item = orgdata.find_by_inn(ss.get("org_inn", ""), key=dadata_key())
     except orgdata.OrgLookupError as e:
         ss.org_error = str(e)
         return
@@ -508,15 +535,35 @@ def org_lookup():
 
 with tab_stamp:
     with st.expander("🔎 Заполнить реквизиты по ИНН своей организации", expanded=False):
-        if not orgdata.api_key():
-            st.warning("Поиск выключен: на сервере не задан ключ DaData. Добавьте переменную окружения "
-                       "**DADATA_API_KEY** в настройках проекта (бесплатный ключ — на dadata.ru, "
-                       "раздел «Профиль» → «API-ключ») и перезапустите приложение.")
+        # --- ключ DaData
+        if ss.get("dadata_key"):
+            k = ss.dadata_key
+            c1, c2 = st.columns([2, 1])
+            c1.success(f"🔑 Используется ваш ключ DaData: {k[:4]}…{k[-4:]}")
+            c2.button("Забыть ключ", on_click=forget_user_key, use_container_width=True)
+        else:
+            if orgdata.api_key():
+                st.caption("🔑 Ключ DaData задан на сервере. При желании можно указать свой ниже.")
+            else:
+                st.info("Для поиска нужен бесплатный ключ DaData: зарегистрируйтесь на "
+                        "[dadata.ru](https://dadata.ru), откройте «Профиль» и скопируйте «API-ключ».")
+            c1, c2 = st.columns([2, 1])
+            c1.text_input("API-ключ DaData", key="dadata_key_input", type="password",
+                          placeholder="Вставьте API-ключ DaData", label_visibility="collapsed")
+            c2.button("Сохранить ключ", on_click=save_user_key, use_container_width=True)
+            st.caption("Ключ хранится только в этой вкладке браузера, на сервер не записывается "
+                       "и пропадёт после её закрытия.")
+        if ss.get("key_msg"):
+            kind_, text_ = ss.key_msg
+            getattr(st, kind_)(text_)
+        has_key = bool(dadata_key())
+
+        # --- поиск
         c1, c2 = st.columns([2, 1])
         c1.text_input("ИНН", key="org_inn", placeholder="10 цифр — организация, 12 — ИП",
-                      label_visibility="collapsed", disabled=not orgdata.api_key())
+                      label_visibility="collapsed", disabled=not has_key)
         c2.button("Найти и заполнить", on_click=org_lookup, use_container_width=True,
-                  disabled=not orgdata.api_key())
+                  disabled=not has_key)
         st.caption("Данные берутся из ЕГРЮЛ/ЕГРИП через DaData. Название, ИНН/ОГРН и город "
                    "подставятся в печать, «И. Фамилия» руководителя — в подпись.")
         if ss.get("org_error"):
