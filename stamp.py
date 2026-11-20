@@ -392,34 +392,45 @@ POSITIONS = {
 }
 
 
-def apply_stamp(pdf_path, stamp_png, output, pages=None, x=0.75, y=0.85, width_mm=40):
-    """Ставит печать (PNG-байты) на страницы PDF.
-      pages — номера страниц с 0 (None — все); x, y — центр печати в долях страницы."""
+def apply_images(pdf_path, items, output, pages=None):
+    """Ставит на страницы PDF несколько картинок (печать, подпись…).
+      items — список словарей {"png": байты, "x": 0..1, "y": 0..1, "width_mm": мм}
+              (x, y — центр картинки в долях страницы; накладываются по порядку)
+      pages — номера страниц с 0 (None — все)."""
     try:
         import pymupdf as fitz
     except ImportError:
         import fitz
     from pdf_edit import open_doc
     doc = open_doc(pdf_path)
-    im = Image.open(io.BytesIO(stamp_png))
-    w_pt = width_mm * 72 / 25.4
-    h_pt = w_pt * im.height / im.width
+    sizes = []
+    for it in items:
+        im = Image.open(io.BytesIO(it["png"]))
+        w_pt = it["width_mm"] * 72 / 25.4
+        sizes.append((w_pt, w_pt * im.height / im.width))
     for i, page in enumerate(doc):
         if pages is not None and i not in pages:
             continue
         if page.rotation:
             page.remove_rotation()
         r = page.rect
-        # не даём печати выйти за край страницы
         m = min(r.width, r.height) * 0.03
-        k = min(1.0, (r.width - 2 * m) / w_pt, (r.height - 2 * m) / h_pt)
-        w, h = w_pt * k, h_pt * k
-        cx = min(max(r.width * x, m + w / 2), r.width - m - w / 2)
-        cy = min(max(r.height * y, m + h / 2), r.height - m - h / 2)
-        rect = fitz.Rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
-        page.insert_image(rect, stream=stamp_png, overlay=True)
+        for it, (w_pt, h_pt) in zip(items, sizes):
+            # не даём картинке выйти за край страницы
+            k = min(1.0, (r.width - 2 * m) / w_pt, (r.height - 2 * m) / h_pt)
+            w, h = w_pt * k, h_pt * k
+            cx = min(max(r.width * it["x"], m + w / 2), r.width - m - w / 2)
+            cy = min(max(r.height * it["y"], m + h / 2), r.height - m - h / 2)
+            page.insert_image(fitz.Rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2),
+                              stream=it["png"], overlay=True)
     if not output.lower().endswith(".pdf"):
         output += ".pdf"
     doc.save(output, garbage=3, deflate=True)
     doc.close()
     return output
+
+
+def apply_stamp(pdf_path, stamp_png, output, pages=None, x=0.75, y=0.85, width_mm=40):
+    """Ставит одну печать (PNG-байты) на страницы PDF."""
+    return apply_images(pdf_path, [{"png": stamp_png, "x": x, "y": y, "width_mm": width_mm}],
+                        output, pages)

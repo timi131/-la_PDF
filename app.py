@@ -17,6 +17,7 @@ import zipfile
 import streamlit as st
 
 import pdf_edit as pe
+import signature as sgn
 import stamp as stp
 from merge_files import SUPPORTED, load_reader, make_groups, merge, parse_ranges, split
 
@@ -58,8 +59,106 @@ def human_size(n):
 st.title("📄 PDF Объединитель")
 st.caption("PDF · JPG · PNG · BMP · GIF · TIFF · WEBP · TXT")
 
-tab_merge, tab_split, tab_edit, tab_stamp = st.tabs(
-    ["🔗 Объединить", "✂ Разделить", "✏ Редактор", "🔵 Печать"])
+tab_merge, tab_split, tab_edit, tab_stamp, tab_sign = st.tabs(
+    ["🔗 Объединить", "✂ Разделить", "✏ Редактор", "🔵 Печать", "✍ Подпись"])
+
+
+# ---------------------- общий блок «Поставить на PDF» (печать и/или подпись) ----------------------
+PLACE_ITEMS = {"stamp": ("Печать", 40, "Снизу справа"), "sign": ("Подпись", 45, "Рядом с печатью")}
+PLACE_POS = dict(stp.POSITIONS, **{"Рядом с печатью": (0.6, 0.83)})
+
+
+def preview_on_paper(png, caption):
+    from PIL import Image as _Img
+    im = _Img.open(io.BytesIO(png))
+    paper = _Img.new("RGBA", (im.width + 40, im.height + 40), (255, 255, 255, 255))
+    paper.alpha_composite(im, (20, 20))
+    st.image(paper, caption=caption, use_container_width=True)
+
+
+def place_on_pdf_ui(prefix, primary):
+    """Блок постановки печати/подписи на PDF. prefix — уникальный префикс ключей."""
+    st.subheader("Поставить на PDF")
+    available = [k for k in PLACE_ITEMS if ss.get("png_" + k)]
+    if not available:
+        return
+    what = st.multiselect("Что поставить", available, default=[primary] if primary in available else [],
+                          format_func=lambda k: PLACE_ITEMS[k][0], key=prefix + "_what",
+                          help="Можно поставить печать и подпись одновременно")
+    if "stamp" not in available or "sign" not in available:
+        other = "подпись (вкладка «✍ Подпись»)" if primary == "stamp" else "печать (вкладка «🔵 Печать»)"
+        st.caption(f"Чтобы поставить ещё и {other}, сначала создайте её на соседней вкладке.")
+    pdf = st.file_uploader("Документ", type=TYPES, key=prefix + "_pdf")
+    if not pdf:
+        st.caption("Загрузите PDF (или картинку), на который нужно поставить печать или подпись.")
+        return
+    if not what:
+        st.info("Выберите, что поставить на документ.")
+        return
+    src_key = prefix + "_src"
+    if ss.get(src_key) != (pdf.name, pdf.size):
+        ss[src_key] = (pdf.name, pdf.size)
+        ss[prefix + "_path"] = save_upload(pdf)
+        ss[prefix + "_total"] = len(load_reader(ss[prefix + "_path"]).pages)
+        ss.pop(prefix + "_result", None)
+    path, total = ss[prefix + "_path"], ss[prefix + "_total"]
+
+    c1, c2 = st.columns([1, 2])
+    where = c1.selectbox("Страницы", ["Последняя", "Первая", "Все", "Указать…"], key=prefix + "_where")
+    rng = c2.text_input("Номера страниц", "1", disabled=where != "Указать…", key=prefix + "_rng",
+                        help="Например: 1, 3-5")
+    try:
+        pages = {"Последняя": [total - 1], "Первая": [0], "Все": list(range(total))}.get(where) \
+            or sorted({i for g in parse_ranges(rng, total) for i in g})
+    except Exception as e:
+        st.error(f"⚠ {e}")
+        return
+
+    items = []
+    cols = st.columns(len(what))
+    for col, k in zip(cols, what):
+        title, mm, pos_default = PLACE_ITEMS[k]
+        with col:
+            st.markdown(f"**{title}**")
+            names = list(PLACE_POS) + ["Своё"]
+            pos = st.selectbox("Положение", names, index=names.index(pos_default),
+                               key=f"{prefix}_{k}_pos")
+            if pos == "Своё":
+                x = st.slider("По горизонтали, %", 0, 100, int(PLACE_POS[pos_default][0] * 100),
+                              key=f"{prefix}_{k}_x") / 100
+                y = st.slider("По вертикали, %", 0, 100, int(PLACE_POS[pos_default][1] * 100),
+                              key=f"{prefix}_{k}_y") / 100
+            else:
+                x, y = PLACE_POS[pos]
+            width = st.slider("Ширина, мм", 15, 120, mm, key=f"{prefix}_{k}_w")
+        items.append({"png": ss["png_" + k], "x": x, "y": y, "width_mm": width, "kind": k})
+    # подпись кладём поверх печати, как на настоящих документах
+    items.sort(key=lambda it: it["kind"] == "sign")
+
+    prev_path = os.path.join(ss.tmp, prefix + "_preview.pdf")
+    stp.apply_images(path, items, prev_path, pages=[pages[0]])
+    pv = pe.fitz.open(prev_path)
+    pix = pv[pages[0]].get_pixmap(dpi=70)
+    pv.close()
+    pc1, pc2 = st.columns([1, 1.4])
+    pc1.image(pix.tobytes("png"), caption=f"Предпросмотр: страница {pages[0] + 1} из {total}",
+              use_container_width=True)
+    with pc2:
+        suffix = "_подписано" if "sign" in what else "_с_печатью"
+        name = clean_name(st.text_input("Имя файла", os.path.splitext(pdf.name)[0] + suffix,
+                                        key=prefix + "_name"), "документ")
+        if st.button("Поставить на документ", type="primary", use_container_width=True,
+                     key=prefix + "_go"):
+            with st.spinner("Обработка…"):
+                out = stp.apply_images(path, items, os.path.join(ss.tmp, prefix + "_" + name),
+                                       pages=pages)
+                with open(out, "rb") as fh:
+                    ss[prefix + "_result"] = (name + ".pdf", fh.read(), len(pages))
+        if ss.get(prefix + "_result"):
+            fname, data, n = ss[prefix + "_result"]
+            st.success(f"Готово: {fname} — на {n} стр.")
+            st.download_button("⬇ Скачать " + fname, data, fname, "application/pdf",
+                               use_container_width=True, key=prefix + "_dl")
 
 # =============================== ОБЪЕДИНИТЬ ===============================
 with tab_merge:
@@ -476,78 +575,97 @@ with tab_stamp:
 
     try:
         png = make_stamp_png(kind_key, tuple(sorted(params.items())))
+        ss.png_stamp = png
     except Exception as e:
         png = None
         right.error(f"Ошибка: {e}")
     with right:
         if png:
-            from PIL import Image as _Img
-            im = _Img.open(io.BytesIO(png))
-            paper = _Img.new("RGBA", (im.width + 40, im.height + 40), (255, 255, 255, 255))
-            paper.alpha_composite(im, (20, 20))
-            st.image(paper, caption="Так печать выглядит на бумаге", use_container_width=True)
+            preview_on_paper(png, "Так печать выглядит на бумаге")
             st.download_button("⬇ Скачать PNG (прозрачный фон)", png, "печать.png", "image/png",
                                use_container_width=True)
 
     st.divider()
-    st.subheader("Поставить печать на PDF")
-    pdf = st.file_uploader("Документ", type=TYPES, key="stamp_pdf")
-    if pdf and png:
-        if ss.get("st_src") != (pdf.name, pdf.size):
-            ss.st_src = (pdf.name, pdf.size)
-            ss.st_path = save_upload(pdf)
-            ss.st_total = len(load_reader(ss.st_path).pages)
-            ss.pop("st_result", None)
-        total = ss.st_total
-        c1, c2, c3 = st.columns(3)
-        where = c1.selectbox("Страницы", ["Последняя", "Первая", "Все", "Указать…"])
-        rng = c1.text_input("Номера страниц", "1", disabled=where != "Указать…",
-                            help="Например: 1, 3-5")
-        pos_name = c2.selectbox("Положение", list(stp.POSITIONS) + ["Своё"])
-        if pos_name == "Своё":
-            x = c2.slider("По горизонтали, %", 0, 100, 75) / 100
-            y = c2.slider("По вертикали, %", 0, 100, 85) / 100
-        else:
-            x, y = stp.POSITIONS[pos_name]
-        width_mm = c3.slider("Диаметр / ширина, мм", 15, 120, 40 if kind_key == "round" else 50)
-        try:
-            if where == "Последняя":
-                pages = [total - 1]
-            elif where == "Первая":
-                pages = [0]
-            elif where == "Все":
-                pages = list(range(total))
-            else:
-                pages = sorted({i for g in parse_ranges(rng, total) for i in g})
-            ok = True
-        except Exception as e:
-            st.error(f"⚠ {e}")
-            ok = False
+    place_on_pdf_ui("pl_stamp", "stamp")
 
-        if ok:
-            # предпросмотр первой выбранной страницы
-            prev_path = os.path.join(ss.tmp, "stamp_preview.pdf")
-            stp.apply_stamp(ss.st_path, png, prev_path, pages=[pages[0]], x=x, y=y, width_mm=width_mm)
-            pv = pe.fitz.open(prev_path)
-            pix = pv[pages[0]].get_pixmap(dpi=70)
-            pv.close()
-            pc1, pc2 = st.columns([1, 1.4])
-            pc1.image(pix.tobytes("png"), caption=f"Предпросмотр: страница {pages[0] + 1} из {total}",
-                      use_container_width=True)
-            with pc2:
-                name = clean_name(st.text_input("Имя файла",
-                                                os.path.splitext(pdf.name)[0] + "_с_печатью"),
-                                  "с_печатью")
-                if st.button("Поставить печать", type="primary", use_container_width=True):
-                    with st.spinner("Обработка…"):
-                        out = stp.apply_stamp(ss.st_path, png, os.path.join(ss.tmp, "stamped_" + name),
-                                              pages=pages, x=x, y=y, width_mm=width_mm)
-                        with open(out, "rb") as fh:
-                            ss.st_result = (name + ".pdf", fh.read())
-                if ss.get("st_result"):
-                    fname, data = ss.st_result
-                    st.success(f"Готово: {fname} — печать на {len(pages)} стр.")
-                    st.download_button("⬇ Скачать " + fname, data, fname, "application/pdf",
-                                       use_container_width=True)
-    elif not pdf:
-        st.caption("Загрузите PDF (или картинку), чтобы поставить на него печать.")
+
+# =============================== ПОДПИСЬ ===============================
+@st.cache_data(show_spinner=False, max_entries=64)
+def make_sign_png(params):
+    return sgn.to_png_bytes(sgn.signature_from_text(**dict(params)))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def clean_photo_png(data, params):
+    return sgn.to_png_bytes(sgn.signature_from_photo(data, **dict(params)))
+
+
+with tab_sign:
+    st.caption("Создавайте и ставьте только свою собственную подпись. "
+               "Подделка чужой подписи незаконна.")
+    left, right = st.columns([1.15, 1])
+    with left:
+        src = st.radio("Способ", ["Из имени (рукописный шрифт)", "Из фото моей подписи"], horizontal=True)
+        ss.setdefault("sg_seed", 1)
+        sign_png = None
+        if src.startswith("Из имени"):
+            text = st.text_input("Текст подписи", "Иванов", help="Фамилия, «И. Иванов» или инициалы")
+            c1, c2 = st.columns(2)
+            font = c1.selectbox("Почерк", list(sgn.FONTS))
+            flourish = c2.selectbox("Росчерк", list(sgn.FLOURISHES), index=1)
+            c1, c2 = st.columns(2)
+            mode = c1.radio("Написание", ["Полностью", "Первые буквы + росчерк"])
+            keep = c2.slider("Сколько букв оставить", 1, 6, 3,
+                             disabled=mode == "Полностью")
+            c1, c2, c3 = st.columns(3)
+            preset = c1.selectbox("Цвет чернил", ["Синий", "Тёмно-синий", "Фиолетовый", "Чёрный", "Свой"])
+            colors = {"Синий": "#1b3fa8", "Тёмно-синий": "#1b2a6f", "Фиолетовый": "#4b2a9f",
+                      "Чёрный": "#1a1a1a"}
+            color = c2.color_picker("Свой цвет", "#1b2a8f") if preset == "Свой" else colors[preset]
+            slant = c3.slider("Наклон, °", -10, 35, 12)
+            c1, c2, c3 = st.columns(3)
+            thickness = c1.slider("Толщина", 0.0, 1.0, 0.2, 0.05)
+            jitter = c2.slider("Живость руки", 0.0, 1.0, 0.35, 0.05,
+                               help="Разный наклон, размер и высота букв — как при письме от руки")
+            pressure = c3.slider("Неровный нажим", 0.0, 1.0, 0.3, 0.05)
+            c1, c2 = st.columns([1, 1])
+            c1.button("🎲 Другой вариант", use_container_width=True,
+                      on_click=lambda: ss.update(sg_seed=ss.sg_seed % 999 + 1))
+            seed = c2.number_input("Номер варианта", 1, 999, key="sg_seed")
+            params = dict(text=text, font=font, flourish=sgn.FLOURISHES[flourish],
+                          mode="full" if mode == "Полностью" else "short", keep_letters=keep,
+                          color=color, slant=slant, thickness=thickness, jitter=jitter,
+                          pressure=pressure, seed=int(seed), size=110)
+            try:
+                sign_png = make_sign_png(tuple(sorted(params.items())))
+            except Exception as e:
+                st.error(f"Ошибка: {e}")
+        else:
+            photo = st.file_uploader("Фото или скан подписи на белой бумаге",
+                                     type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
+                                     key="sg_photo")
+            st.caption("Совет: распишитесь ручкой на чистом листе и сфотографируйте при хорошем свете.")
+            c1, c2 = st.columns(2)
+            sens = c1.slider("Чувствительность", 0.0, 1.0, 0.5, 0.05,
+                             help="Больше — сохраняются тонкие и светлые штрихи; меньше — убирается грязь")
+            keep_color = c2.checkbox("Оставить исходный цвет чернил", False)
+            preset = c2.selectbox("Цвет чернил", ["Синий", "Тёмно-синий", "Фиолетовый", "Чёрный"],
+                                  disabled=keep_color)
+            colors = {"Синий": "#1b3fa8", "Тёмно-синий": "#1b2a6f", "Фиолетовый": "#4b2a9f",
+                      "Чёрный": "#1a1a1a"}
+            if photo:
+                try:
+                    sign_png = clean_photo_png(photo.getvalue(), tuple(sorted(dict(
+                        color=colors[preset], keep_color=keep_color, sensitivity=sens).items())))
+                except Exception as e:
+                    st.error(f"⚠ {e}")
+        ss.png_sign = sign_png or ss.get("png_sign")
+    with right:
+        if sign_png:
+            preview_on_paper(sign_png, "Так подпись выглядит на бумаге")
+            st.download_button("⬇ Скачать PNG (прозрачный фон)", sign_png, "подпись.png", "image/png",
+                               use_container_width=True)
+        else:
+            st.info("Здесь появится подпись.")
+    st.divider()
+    place_on_pdf_ui("pl_sign", "sign")
