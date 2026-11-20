@@ -17,7 +17,8 @@ import zipfile
 import streamlit as st
 
 import pdf_edit as pe
-from merge_files import SUPPORTED, load_reader, make_groups, merge, split
+import stamp as stp
+from merge_files import SUPPORTED, load_reader, make_groups, merge, parse_ranges, split
 
 st.set_page_config(page_title="PDF Объединитель", page_icon="📄", layout="wide")
 
@@ -57,7 +58,8 @@ def human_size(n):
 st.title("📄 PDF Объединитель")
 st.caption("PDF · JPG · PNG · BMP · GIF · TIFF · WEBP · TXT")
 
-tab_merge, tab_split, tab_edit = st.tabs(["🔗 Объединить", "✂ Разделить", "✏ Редактор"])
+tab_merge, tab_split, tab_edit, tab_stamp = st.tabs(
+    ["🔗 Объединить", "✂ Разделить", "✏ Редактор", "🔵 Печать"])
 
 # =============================== ОБЪЕДИНИТЬ ===============================
 with tab_merge:
@@ -373,3 +375,140 @@ with tab_edit:
             st.success(f"Готово: {fname} ({human_size(len(data))})")
             st.download_button("⬇ Скачать " + fname, data, fname, "application/pdf",
                                use_container_width=True)
+
+# =============================== ПЕЧАТЬ ===============================
+@st.cache_data(show_spinner=False, max_entries=64)
+def make_stamp_png(kind, params):
+    p = dict(params)
+    img = stp.round_stamp(**p) if kind == "round" else stp.rect_stamp(**p)
+    return stp.to_png_bytes(img)
+
+
+with tab_stamp:
+    left, right = st.columns([1.15, 1])
+    with left:
+        kind = st.radio("Вид", ["Круглая печать", "Прямоугольный штамп"], horizontal=True)
+        if kind == "Круглая печать":
+            outer = st.text_input("Текст по кругу", 'ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ «НАЗВАНИЕ»')
+            bottom = st.text_input("Текст внизу круга (необязательно)", "",
+                                   help="Если заполнено — верхний текст идёт дугой, а этот снизу")
+            inner = st.text_input("Внутреннее кольцо (необязательно)", "ИНН 0000000000 • ОГРН 0000000000000")
+            center = st.text_area("Текст в центре (каждая строка отдельно)", "г. Москва", height=80)
+            c1, c2 = st.columns(2)
+            emblem = c1.selectbox("Символ в центре", ["нет", "звезда"])
+            separator = c2.selectbox("Разделитель в кольце", [" ★ ", " • ", " ✦ ", "  "],
+                                     format_func=lambda x: x.strip() or "пробел")
+            c1, c2, c3 = st.columns(3)
+            double = c1.checkbox("Двойная рамка", True)
+            fill = c2.checkbox("Текст по всему кругу", True)
+            serif = c3.checkbox("С засечками", False)
+            params = dict(outer_text=outer, bottom_text=bottom, inner_text=inner,
+                          center_lines=tuple(center.splitlines()),
+                          emblem="star" if emblem == "звезда" else "none",
+                          double_border=double, fill_circle=fill, separator=separator, serif=serif)
+            kind_key = "round"
+        else:
+            lines = st.text_area("Текст штампа (каждая строка отдельно)", "ОПЛАЧЕНО\n20.11.2026", height=100)
+            c1, c2 = st.columns(2)
+            ratio = c1.slider("Ширина : высота", 1.0, 4.0, 2.3, 0.1)
+            corner = c2.slider("Скругление углов", 0, 30, 6)
+            c1, c2 = st.columns(2)
+            double = c1.checkbox("Двойная рамка", True)
+            serif = c2.checkbox("С засечками", False)
+            params = dict(lines=tuple(lines.splitlines()), width=int(300 * ratio), height=300,
+                          double_border=double, corner=corner, serif=serif)
+            kind_key = "rect"
+
+        st.markdown("**Оформление**")
+        c1, c2, c3 = st.columns(3)
+        preset = c1.selectbox("Цвет", ["Синий", "Фиолетовый", "Красный", "Чёрный", "Свой"])
+        colors = {"Синий": "#1f3fbf", "Фиолетовый": "#6a2fbf", "Красный": "#c0282d", "Чёрный": "#222222"}
+        color = c2.color_picker("Свой цвет", "#1f3fbf", disabled=preset != "Свой") \
+            if preset == "Свой" else colors[preset]
+        border = c3.slider("Толщина рамки", 0.5, 5.0, 2.2 if kind_key == "round" else 2.0, 0.1)
+        c1, c2, c3 = st.columns(3)
+        ink = c1.slider("Эффект оттиска", 0.0, 1.0, 0.35, 0.05,
+                        help="0 — идеально ровная краска, 1 — сильно потёртый оттиск")
+        rotation = c2.slider("Наклон, °", -45, 45, 0)
+        opacity = c3.slider("Непрозрачность", 0.3, 1.0, 0.95, 0.05)
+        params.update(color=color, border=border, ink=ink, rotation=rotation, opacity=opacity)
+        if kind_key == "round":
+            params["size"] = 600
+
+    try:
+        png = make_stamp_png(kind_key, tuple(sorted(params.items())))
+    except Exception as e:
+        png = None
+        right.error(f"Ошибка: {e}")
+    with right:
+        if png:
+            from PIL import Image as _Img
+            im = _Img.open(io.BytesIO(png))
+            paper = _Img.new("RGBA", (im.width + 40, im.height + 40), (255, 255, 255, 255))
+            paper.alpha_composite(im, (20, 20))
+            st.image(paper, caption="Так печать выглядит на бумаге", use_container_width=True)
+            st.download_button("⬇ Скачать PNG (прозрачный фон)", png, "печать.png", "image/png",
+                               use_container_width=True)
+
+    st.divider()
+    st.subheader("Поставить печать на PDF")
+    pdf = st.file_uploader("Документ", type=TYPES, key="stamp_pdf")
+    if pdf and png:
+        if ss.get("st_src") != (pdf.name, pdf.size):
+            ss.st_src = (pdf.name, pdf.size)
+            ss.st_path = save_upload(pdf)
+            ss.st_total = len(load_reader(ss.st_path).pages)
+            ss.pop("st_result", None)
+        total = ss.st_total
+        c1, c2, c3 = st.columns(3)
+        where = c1.selectbox("Страницы", ["Последняя", "Первая", "Все", "Указать…"])
+        rng = c1.text_input("Номера страниц", "1", disabled=where != "Указать…",
+                            help="Например: 1, 3-5")
+        pos_name = c2.selectbox("Положение", list(stp.POSITIONS) + ["Своё"])
+        if pos_name == "Своё":
+            x = c2.slider("По горизонтали, %", 0, 100, 75) / 100
+            y = c2.slider("По вертикали, %", 0, 100, 85) / 100
+        else:
+            x, y = stp.POSITIONS[pos_name]
+        width_mm = c3.slider("Диаметр / ширина, мм", 15, 120, 40 if kind_key == "round" else 50)
+        try:
+            if where == "Последняя":
+                pages = [total - 1]
+            elif where == "Первая":
+                pages = [0]
+            elif where == "Все":
+                pages = list(range(total))
+            else:
+                pages = sorted({i for g in parse_ranges(rng, total) for i in g})
+            ok = True
+        except Exception as e:
+            st.error(f"⚠ {e}")
+            ok = False
+
+        if ok:
+            # предпросмотр первой выбранной страницы
+            prev_path = os.path.join(ss.tmp, "stamp_preview.pdf")
+            stp.apply_stamp(ss.st_path, png, prev_path, pages=[pages[0]], x=x, y=y, width_mm=width_mm)
+            pv = pe.fitz.open(prev_path)
+            pix = pv[pages[0]].get_pixmap(dpi=70)
+            pv.close()
+            pc1, pc2 = st.columns([1, 1.4])
+            pc1.image(pix.tobytes("png"), caption=f"Предпросмотр: страница {pages[0] + 1} из {total}",
+                      use_container_width=True)
+            with pc2:
+                name = clean_name(st.text_input("Имя файла",
+                                                os.path.splitext(pdf.name)[0] + "_с_печатью"),
+                                  "с_печатью")
+                if st.button("Поставить печать", type="primary", use_container_width=True):
+                    with st.spinner("Обработка…"):
+                        out = stp.apply_stamp(ss.st_path, png, os.path.join(ss.tmp, "stamped_" + name),
+                                              pages=pages, x=x, y=y, width_mm=width_mm)
+                        with open(out, "rb") as fh:
+                            ss.st_result = (name + ".pdf", fh.read())
+                if ss.get("st_result"):
+                    fname, data = ss.st_result
+                    st.success(f"Готово: {fname} — печать на {len(pages)} стр.")
+                    st.download_button("⬇ Скачать " + fname, data, fname, "application/pdf",
+                                       use_container_width=True)
+    elif not pdf:
+        st.caption("Загрузите PDF (или картинку), чтобы поставить на него печать.")
