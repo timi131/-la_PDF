@@ -426,12 +426,51 @@ with tab_stamp:
         color = c2.color_picker("Свой цвет", "#1f3fbf", disabled=preset != "Свой") \
             if preset == "Свой" else colors[preset]
         border = c3.slider("Толщина рамки", 0.5, 5.0, 2.2 if kind_key == "round" else 2.0, 0.1)
-        c1, c2, c3 = st.columns(3)
-        ink = c1.slider("Эффект оттиска", 0.0, 1.0, 0.35, 0.05,
-                        help="0 — идеально ровная краска, 1 — сильно потёртый оттиск")
-        rotation = c2.slider("Наклон, °", -45, 45, 0)
-        opacity = c3.slider("Непрозрачность", 0.3, 1.0, 0.95, 0.05)
-        params.update(color=color, border=border, ink=ink, rotation=rotation, opacity=opacity)
+        border_style = st.radio("Рамка", ["Сплошная", "Прерывистая (пунктир)"], horizontal=True)
+
+        st.markdown("**Потёртость и прозрачность**")
+        WEAR_PRESETS = {
+            "Новая (чистая)": (0.0, 0.0, 0.0, 0),
+            "Обычный оттиск": (0.15, 0.0, 0.3, 5),
+            "Слегка потёртая": (0.3, 0.1, 0.35, 5),
+            "Потёртая": (0.45, 0.25, 0.4, 10),
+            "Старая, прерывистая": (0.55, 0.4, 0.5, 15),
+        }
+        ss.setdefault("st_wear", 0.15)
+        ss.setdefault("st_breaks", 0.0)
+        ss.setdefault("st_uneven", 0.3)
+        ss.setdefault("st_transp", 5)
+        ss.setdefault("st_seed", 1)
+
+        def apply_preset():
+            w, b_, u, t = WEAR_PRESETS[ss.st_preset]
+            ss.st_wear, ss.st_breaks, ss.st_uneven, ss.st_transp = w, b_, u, t
+
+        def new_seed():
+            ss.st_seed = (ss.st_seed % 999) + 1
+
+        c1, c2 = st.columns([2, 1])
+        c1.selectbox("Готовый вариант", list(WEAR_PRESETS), index=1, key="st_preset",
+                     on_change=apply_preset)
+        c2.button("🎲 Другой узор", on_click=new_seed, use_container_width=True,
+                  help="Сгенерировать другое случайное расположение потёртостей")
+        c1, c2 = st.columns(2)
+        wear = c1.slider("Потёртость", 0.0, 1.0, step=0.05, key="st_wear",
+                         help="Мелкие пятнышки и зерно без краски")
+        breaks = c2.slider("Прерывистость", 0.0, 1.0, step=0.05, key="st_breaks",
+                           help="Разрывы линий и букв, непропечатанные участки, царапины")
+        c1, c2 = st.columns(2)
+        uneven = c1.slider("Неравномерный нажим", 0.0, 1.0, step=0.05, key="st_uneven",
+                           help="Одна сторона печати бледнее, краска ложится пятнами")
+        transp = c2.slider("Прозрачность, %", 0, 80, step=5, key="st_transp",
+                           help="0 — насыщенный цвет, 80 — едва заметный оттиск")
+        c1, c2 = st.columns(2)
+        rotation = c1.slider("Наклон, °", -45, 45, 0)
+        seed = c2.number_input("Номер узора", 1, 999, key="st_seed",
+                               help="Один и тот же номер даёт одинаковый узор потёртостей")
+        params.update(color=color, border=border, rotation=rotation, opacity=1 - transp / 100,
+                      wear=wear, breaks=breaks, uneven=uneven, seed=int(seed),
+                      dashed=border_style.startswith("Прерывистая"))
         if kind_key == "round":
             params["size"] = 600
 

@@ -8,9 +8,8 @@
 import io
 import math
 import os
-import random
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 SS = 3  # суперсэмплинг для гладких краёв
 
@@ -46,9 +45,38 @@ def hex_to_rgb(c):
 
 
 # ---------------------------------------------------------------- рисование
-def _circle(draw, cx, cy, r, width, color):
-    if width > 0 and r > 0:
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=color, width=int(width))
+def _circle(draw, cx, cy, r, width, color, dashed=False):
+    """Окружность; dashed=True — пунктирная (прерывистая) линия."""
+    if width <= 0 or r <= 0:
+        return
+    box = (cx - r, cy - r, cx + r, cy + r)
+    if not dashed:
+        draw.ellipse(box, outline=color, width=int(width))
+        return
+    # длина штриха ~ 3 толщины линии, промежуток ~ 1.6 толщины
+    circ = 2 * math.pi * r
+    n = max(8, int(circ / (width * 4.6)))
+    step = 360 / n
+    for i in range(n):
+        a0 = i * step
+        draw.arc(box, a0, a0 + step * 0.65, fill=color, width=int(width))
+
+
+def _dashed_rect(draw, box, width, color):
+    """Прямоугольник пунктиром."""
+    x0, y0, x1, y1 = box
+    dash, gap = width * 3, width * 1.6
+    w = int(width)
+    for (ax, ay, bx, by) in ((x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)):
+        length = math.hypot(bx - ax, by - ay)
+        n = max(1, int((length + gap) / (dash + gap)))
+        real_gap = (length - n * dash) / max(n - 1, 1) if n > 1 else 0
+        ux, uy = (bx - ax) / length, (by - ay) / length
+        t = 0.0
+        for _ in range(n):
+            e = min(t + dash, length)
+            draw.line((ax + ux * t, ay + uy * t, ax + ux * e, ay + uy * e), fill=color, width=w)
+            t = e + real_gap
 
 
 def _text_on_circle(img, text, cx, cy, radius, font, color, span_deg=None, bottom=False,
@@ -146,28 +174,80 @@ def _star(draw, cx, cy, r, color):
     draw.polygon(pts, fill=color + (255,))
 
 
-def _ink(img, strength, seed=None):
-    """Эффект настоящего оттиска: неравномерная краска, потёртости."""
-    if strength <= 0:
+def _noise(rng, w, h, cell):
+    """Плавный случайный шум 0..1 с размером «пятна» около cell пикселей."""
+    import numpy as np
+    sw, sh = max(2, int(w / cell) + 2), max(2, int(h / cell) + 2)
+    small = Image.fromarray((rng.random((sh, sw)) * 255).astype("uint8"), "L")
+    return np.asarray(small.resize((w, h), Image.BICUBIC), dtype="float32") / 255
+
+
+def _wear(img, wear=0.0, breaks=0.0, uneven=0.0, seed=1):
+    """Эффекты настоящего оттиска (все параметры 0..1):
+      wear   — потёртость: мелкие пятнышки и зерно без краски
+      breaks — прерывистость: разрывы линий и букв, царапины
+      uneven — неравномерный нажим: одна сторона бледнее, краска пятнами
+    """
+    if wear <= 0 and breaks <= 0 and uneven <= 0:
         return img
-    rnd = random.Random(seed)
+    import numpy as np
+    rng = np.random.default_rng(seed)
     w, h = img.size
-    # крупные пятна неравномерного прижатия
-    small = Image.new("L", (max(1, w // 40), max(1, h // 40)))
-    small.putdata([int(255 - rnd.random() * 140 * strength) for _ in range(small.width * small.height)])
-    blot = small.resize((w, h), Image.BICUBIC).filter(ImageFilter.GaussianBlur(w / 60))
-    # мелкие «проплешины»
-    noise = Image.effect_noise((w, h), 80).point(lambda v: 0 if v < 255 * (0.18 * strength) + 40 else 255)
-    noise = noise.filter(ImageFilter.GaussianBlur(1.2)).point(lambda v: 255 if v > 90 else int(v * 2))
-    alpha = img.getchannel("A")
-    alpha = ImageChops.multiply(alpha, blot)
-    alpha = ImageChops.multiply(alpha, noise)
-    img.putalpha(alpha)
+    base = max(w, h)
+    k = np.ones((h, w), dtype="float32")
+
+    if uneven > 0:
+        # градиент нажима в случайном направлении + крупные пятна
+        ang = rng.random() * 2 * math.pi
+        yy, xx = np.mgrid[0:h, 0:w].astype("float32")
+        g = ((xx - w / 2) * math.cos(ang) + (yy - h / 2) * math.sin(ang)) / (base / 2)
+        g = (g + 1) / 2                                   # 0..1 поперёк печати
+        k *= 1 - uneven * 0.65 * np.clip(g, 0, 1) ** 1.5
+        k *= 1 - uneven * 0.45 * _noise(rng, w, h, base / 6)
+
+    if wear > 0:
+        # средние пятна + мелкое зерно; чем больше wear, тем больше «дыр»
+        n1 = _noise(rng, w, h, base / 70)
+        n2 = _noise(rng, w, h, base / 220)
+        mix = n1 * 0.6 + n2 * 0.4
+        thr = 0.30 + 0.32 * wear
+        holes = np.clip((mix - (1 - thr)) / 0.06, 0, 1)   # 1 там, где краски нет
+        grain = rng.random((h, w)).astype("float32")
+        k *= 1 - holes
+        k *= 1 - (grain < wear * 0.22) * 0.85
+
+    if breaks > 0:
+        # крупные разрывы: вытянутые «пустые» участки
+        n3 = _noise(rng, w, h, base / 14)
+        thr = 0.04 + 0.30 * breaks
+        k *= np.clip((n3 - thr) / 0.05, 0, 1)
+        # разрывы по секторам (как будто печать не пропечаталась местами)
+        yy, xx = np.mgrid[0:h, 0:w].astype("float32")
+        theta = (np.degrees(np.arctan2(yy - h / 2, xx - w / 2)) + 360) % 360
+        for _ in range(int(2 + breaks * 8)):
+            c0 = rng.random() * 360
+            width = 2 + rng.random() * 10 * breaks
+            d = np.abs((theta - c0 + 180) % 360 - 180)
+            k *= np.clip((d - width * 0.6) / (width * 0.4 + 1.5), 0, 1)
+        # царапины
+        mask = Image.new("L", (w, h), 255)
+        md = ImageDraw.Draw(mask)
+        for _ in range(int(breaks * 7)):
+            x0, y0 = rng.random() * w, rng.random() * h
+            a = rng.random() * math.pi
+            ln = base * (0.15 + rng.random() * 0.45)
+            md.line((x0, y0, x0 + ln * math.cos(a), y0 + ln * math.sin(a)), fill=0,
+                    width=max(2, int(base * (0.003 + rng.random() * 0.006))))
+        mask = mask.filter(ImageFilter.GaussianBlur(base / 900))
+        k *= np.asarray(mask, dtype="float32") / 255
+
+    alpha = np.asarray(img.getchannel("A"), dtype="float32") * np.clip(k, 0, 1)
+    img.putalpha(Image.fromarray(alpha.astype("uint8"), "L"))
     return img
 
 
-def _finish(img, size, opacity, ink, rotation, seed):
-    img = _ink(img, ink, seed)
+def _finish(img, opacity, rotation, seed, wear=0.0, breaks=0.0, uneven=0.0):
+    img = _wear(img, wear, breaks, uneven, seed)
     if rotation:
         img = img.rotate(-rotation, resample=Image.BICUBIC, expand=True)
     img = img.resize((int(img.width / SS), int(img.height / SS)), Image.LANCZOS)
@@ -180,8 +260,8 @@ def _finish(img, size, opacity, ink, rotation, seed):
 def round_stamp(outer_text="ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ", bottom_text="",
                 inner_text="", center_lines=("ОБРАЗЕЦ",), emblem="none",
                 color="#1f3fbf", size=600, border=2.2, double_border=True,
-                fill_circle=True, separator=" ★ ", serif=False, bold=True,
-                ink=0.0, opacity=1.0, rotation=0, seed=1):
+                fill_circle=True, separator=" ★ ", serif=False, bold=True, dashed=False,
+                wear=0.0, breaks=0.0, uneven=0.0, opacity=1.0, rotation=0, seed=1, ink=None):
     """Круглая печать.
       outer_text  — текст по внешнему кругу
       bottom_text — текст по низу внешнего круга (тогда outer_text идёт дугой сверху)
@@ -189,8 +269,14 @@ def round_stamp(outer_text="ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВ�
       center_lines — строки в центре
       emblem      — "none" | "star" (звезда над центральным текстом)
       border      — толщина рамки, % от размера
-      ink         — 0..1, эффект настоящего оттиска
+      dashed      — пунктирная (прерывистая) рамка
+      wear        — 0..1, потёртость (пятнышки без краски)
+      breaks      — 0..1, прерывистость (разрывы линий и букв, царапины)
+      uneven      — 0..1, неравномерный нажим
+      opacity     — 0..1, непрозрачность (1 — без прозрачности)
       rotation    — поворот печати, градусы
+      seed        — номер варианта случайного узора
+      ink         — устаревший параметр: задаёт wear и uneven одним числом
     """
     rgb = hex_to_rgb(color)
     S = size * SS
@@ -202,11 +288,11 @@ def round_stamp(outer_text="ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВ�
     R = S / 2 - bw / 2 - 2
     col = rgb + (255,)
 
-    _circle(d, c, c, R, bw, col)
+    _circle(d, c, c, R, bw, col, dashed)
     r = R - bw / 2
     if double_border:
         r -= S * 0.012
-        _circle(d, c, c, r - thin / 2, thin, col)
+        _circle(d, c, c, r - thin / 2, thin, col, dashed)
         r -= thin
 
     # внешний текст
@@ -225,7 +311,7 @@ def round_stamp(outer_text="ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВ�
         else:
             _arc_text(img, main, c, r_text, outer_fs, rgb, fill_circle, separator, bold, serif)
         r -= ring_h
-        _circle(d, c, c, r - thin / 2, thin, col)
+        _circle(d, c, c, r - thin / 2, thin, col, dashed)
         r -= thin
 
     # внутреннее кольцо
@@ -236,7 +322,7 @@ def round_stamp(outer_text="ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВ�
         main = inner_text.strip()
         _arc_text(img, main, c, r_text, fs, rgb, fill_circle, separator, bold, serif)
         r -= ring2
-        _circle(d, c, c, r - thin / 2, thin, col)
+        _circle(d, c, c, r - thin / 2, thin, col, dashed)
         r -= thin
 
     # центр
@@ -252,12 +338,14 @@ def round_stamp(outer_text="ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВ�
         size_c = S * (0.085 if len(lines) <= 2 else 0.065)
         _center_lines(img, lines, c, cy, max_w, size_c, rgb, bold, serif)
 
-    return _finish(img, size, opacity, ink, rotation, seed)
+    if ink is not None:
+        wear, uneven = wear or ink, uneven or ink
+    return _finish(img, opacity, rotation, seed, wear, breaks, uneven)
 
 
 def rect_stamp(lines=("ОБРАЗЕЦ",), color="#1f3fbf", width=700, height=300, border=2.0,
-               double_border=True, corner=6, serif=False, bold=True,
-               ink=0.0, opacity=1.0, rotation=0, seed=1):
+               double_border=True, corner=6, serif=False, bold=True, dashed=False,
+               wear=0.0, breaks=0.0, uneven=0.0, opacity=1.0, rotation=0, seed=1, ink=None):
     """Прямоугольный штамп (например, «ОПЛАЧЕНО», «КОПИЯ ВЕРНА», угловой штамп)."""
     rgb = hex_to_rgb(color)
     W, H = width * SS, height * SS
@@ -268,18 +356,26 @@ def rect_stamp(lines=("ОБРАЗЕЦ",), color="#1f3fbf", width=700, height=300
     thin = max(2, bw * 0.45)
     rad = min(W, H) * corner / 100
     m = bw / 2 + 2
-    d.rounded_rectangle((m, m, W - m, H - m), radius=rad, outline=col, width=int(bw))
+    if dashed:
+        _dashed_rect(d, (m, m, W - m, H - m), bw, col)
+    else:
+        d.rounded_rectangle((m, m, W - m, H - m), radius=rad, outline=col, width=int(bw))
     inset = m
     if double_border:
         inset = m + bw / 2 + min(W, H) * 0.03
-        d.rounded_rectangle((inset, inset, W - inset, H - inset), radius=max(0, rad * 0.7),
-                            outline=col, width=int(thin))
+        if dashed:
+            _dashed_rect(d, (inset, inset, W - inset, H - inset), thin, col)
+        else:
+            d.rounded_rectangle((inset, inset, W - inset, H - inset), radius=max(0, rad * 0.7),
+                                outline=col, width=int(thin))
     lines = [ln for ln in lines if ln.strip()]
     if lines:
         avail_h = H - 2 * inset - min(W, H) * 0.08
         size_c = min(avail_h / len(lines) / 1.2, H * 0.4)
         _center_lines(img, lines, W / 2, H / 2, W - 2 * inset - W * 0.06, size_c, rgb, bold, serif)
-    return _finish(img, None, opacity, ink, rotation, seed)
+    if ink is not None:
+        wear, uneven = wear or ink, uneven or ink
+    return _finish(img, opacity, rotation, seed, wear, breaks, uneven)
 
 
 def to_png_bytes(img, dpi=300):
