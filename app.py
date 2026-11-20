@@ -17,6 +17,7 @@ import zipfile
 import streamlit as st
 
 import pdf_edit as pe
+import orgdata
 import signature as sgn
 import stamp as stp
 from merge_files import SUPPORTED, load_reader, make_groups, merge, parse_ranges, split
@@ -483,16 +484,67 @@ def make_stamp_png(kind, params):
     return stp.to_png_bytes(img)
 
 
+def org_lookup():
+    """Заполняет поля печати и подписи реквизитами по ИНН (DaData)."""
+    ss.pop("org_details", None)
+    ss.pop("org_error", None)
+    try:
+        item = orgdata.find_by_inn(ss.get("org_inn", ""))
+    except orgdata.OrgLookupError as e:
+        ss.org_error = str(e)
+        return
+    if not item:
+        ss.org_error = "Организация с таким ИНН не найдена."
+        return
+    det = orgdata.to_details(item)
+    f = orgdata.stamp_fields(det)
+    ss.st_kind = "Круглая печать"
+    ss.st_outer, ss.st_inner, ss.st_center, ss.st_bottom = f["outer"], f["inner"], f["center"], ""
+    sig = orgdata.signature_text(det)
+    if sig:
+        ss.sg_text = sig
+    ss.org_details = det
+
+
 with tab_stamp:
+    with st.expander("🔎 Заполнить реквизиты по ИНН своей организации", expanded=False):
+        if not orgdata.api_key():
+            st.warning("Поиск выключен: на сервере не задан ключ DaData. Добавьте переменную окружения "
+                       "**DADATA_API_KEY** в настройках проекта (бесплатный ключ — на dadata.ru, "
+                       "раздел «Профиль» → «API-ключ») и перезапустите приложение.")
+        c1, c2 = st.columns([2, 1])
+        c1.text_input("ИНН", key="org_inn", placeholder="10 цифр — организация, 12 — ИП",
+                      label_visibility="collapsed", disabled=not orgdata.api_key())
+        c2.button("Найти и заполнить", on_click=org_lookup, use_container_width=True,
+                  disabled=not orgdata.api_key())
+        st.caption("Данные берутся из ЕГРЮЛ/ЕГРИП через DaData. Название, ИНН/ОГРН и город "
+                   "подставятся в печать, «И. Фамилия» руководителя — в подпись.")
+        if ss.get("org_error"):
+            st.error(ss.org_error)
+        det = ss.get("org_details")
+        if det:
+            msg = (f"**{det['short_name']}**  \nИНН {det['inn']}"
+                   + (f" · КПП {det['kpp']}" if det["kpp"] else "")
+                   + f" · {'ОГРНИП' if det['type'] == 'ИП' else 'ОГРН'} {det['ogrn']}  \n{det['address']}"
+                   + (f"  \n{det['manager_post']}: {det['manager']}" if det["manager"] else ""))
+            if det["status"] and det["status"] != "действующая":
+                st.warning(f"Статус: {det['status']}.  \n" + msg)
+            else:
+                st.success(msg)
+
+    ss.setdefault("st_outer", "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ «НАЗВАНИЕ»")
+    ss.setdefault("st_bottom", "")
+    ss.setdefault("st_inner", "ИНН 0000000000 • ОГРН 0000000000000")
+    ss.setdefault("st_center", "г. Москва")
     left, right = st.columns([1.15, 1])
     with left:
-        kind = st.radio("Вид", ["Круглая печать", "Прямоугольный штамп"], horizontal=True)
+        kind = st.radio("Вид", ["Круглая печать", "Прямоугольный штамп"], horizontal=True, key="st_kind")
         if kind == "Круглая печать":
-            outer = st.text_input("Текст по кругу", 'ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ «НАЗВАНИЕ»')
-            bottom = st.text_input("Текст внизу круга (необязательно)", "",
+            outer = st.text_input("Текст по кругу", key="st_outer")
+            bottom = st.text_input("Текст внизу круга (необязательно)", key="st_bottom",
                                    help="Если заполнено — верхний текст идёт дугой, а этот снизу")
-            inner = st.text_input("Внутреннее кольцо (необязательно)", "ИНН 0000000000 • ОГРН 0000000000000")
-            center = st.text_area("Текст в центре (каждая строка отдельно)", "г. Москва", height=80)
+            inner = st.text_input("Внутреннее кольцо (необязательно)", key="st_inner")
+            center = st.text_area("Текст в центре (каждая строка отдельно)", key="st_center", height=80)
             c1, c2 = st.columns(2)
             emblem = c1.selectbox("Символ в центре", ["нет", "звезда"])
             separator = c2.selectbox("Разделитель в кольце", [" ★ ", " • ", " ✦ ", "  "],
@@ -609,7 +661,8 @@ with tab_sign:
         ss.setdefault("sg_seed", 1)
         sign_png = None
         if src.startswith("Из имени"):
-            text = st.text_input("Текст подписи", "Иванов", help="Фамилия, «И. Иванов» или инициалы")
+            ss.setdefault("sg_text", "Иванов")
+            text = st.text_input("Текст подписи", key="sg_text", help="Фамилия, «И. Иванов» или инициалы")
             c1, c2 = st.columns(2)
             font = c1.selectbox("Почерк", list(sgn.FONTS))
             flourish = c2.selectbox("Росчерк", list(sgn.FLOURISHES), index=1)
