@@ -546,6 +546,7 @@ def apply_org(det):
         ss.doc_f_director = docgen.fio_genitive(det["manager"])
         ss.doc_sign_director = docgen.fio_short(det["manager"])
         ss.doc_f_director_short = docgen.fio_short(det["manager"])
+        ss.doc_f_director_nom = det["manager"]
 
 
 with tab_stamp:
@@ -804,9 +805,18 @@ def doc_lookup():
         f" · статус: {det['status']}" if det["status"] and det["status"] != "действующая" else "")
 
 
-def header_ui(prefix):
-    """Блок «Шапка документа». Возвращает (включена, кому, заголовок)."""
+def header_ui(prefix, in_template=False):
+    """Блок «Шапка документа». Возвращает (включена, кому, заголовок).
+    in_template=True — шапка уже есть в шаблоне, выбираем только «Кому»."""
     st.markdown("**Шапка документа**")
+    if in_template:
+        opts = docgen.OPERATORS + ["Свой вариант…"]
+        c1, c2 = st.columns([2, 1.4])
+        to = c1.selectbox("Кому", opts, key=prefix + "_hdr_to")
+        if to == "Свой вариант…":
+            to = c2.text_input("Кому (свой текст)", key=prefix + "_hdr_to_own",
+                               placeholder="Например: Оператору мобильной связи ПАО «МегаФон»")
+        return False, to, None
     c1, c2, c3 = st.columns([0.8, 2, 1.4])
     on = c1.checkbox("Добавить", True, key=prefix + "_hdr_on")
     opts = docgen.OPERATORS + ["Свой вариант…"]
@@ -822,6 +832,7 @@ def decline_director(nom):
     """«Петров Пётр Петрович» → в тексте «Петрова Петра Петровича», в подписи «П.П. Петров»."""
     ss.doc_f_director = docgen.fio_genitive(nom)
     ss.doc_sign_director = docgen.fio_short(nom)
+    ss.doc_f_director_nom = nom
 
 
 with tab_docs:
@@ -878,7 +889,7 @@ with tab_docs:
             date_fmt = st.selectbox("Формат дат", list(docgen.DATE_FORMATS), key="doc_date_fmt")
             values, sign_values = {}, {}
             cols = st.columns(2)
-            for i, k in enumerate(keys):
+            for i, k in enumerate([k for k in keys if k != "operator"]):
                 col = cols[i % 2]
                 lab, h = docgen.label(k), docgen.hint(k) or None
                 if docgen.field_type(k) == "date":
@@ -886,7 +897,7 @@ with tab_docs:
                     d = col.date_input(lab, default, key=f"doc_f_{k}", format="DD.MM.YYYY", help=h)
                     values[k] = docgen.format_date(d, date_fmt)
                 else:
-                    if k == "director" and "director" in sign_keys:
+                    if k == "director" and ("director" in sign_keys or "director_nom" in keys):
                         lab = "ФИО руководителя в тексте (родительный падеж)"
                         h = "Как после слов «в лице генерального директора …», например: Петрова Петра Петровича"
                     values[k] = col.text_input(lab, key=f"doc_f_{k}", help=h)
@@ -896,17 +907,20 @@ with tab_docs:
                         col.button("Просклонять ФИО", key="doc_decline", on_click=decline_director,
                                    args=(values[k],))
             # строка подписи
-            if sign_keys:
+            sign_over = [k for k in sign_keys if k == "director"]   # одно поле в двух падежах
+            if sign_over:
                 st.markdown("**Строка подписи** (внизу документа)")
-                cols = st.columns(len(sign_keys))
-                for col, k in zip(cols, sign_keys):
+                cols = st.columns(len(sign_over))
+                for col, k in zip(cols, sign_over):
                     sign_values[k] = col.text_input(
                         f"{docgen.label(k)} — в строке подписи", key=f"doc_sign_{k}",
                         placeholder=values.get(k, ""),
                         help="Если оставить пустым — будет то же, что и в тексте. "
                              "Для руководителя обычно «И.О. Фамилия».")
 
-            d_header = header_ui("doc")
+            d_header = header_ui("doc", in_template="operator" in keys)
+            if "operator" in keys:
+                values["operator"] = d_header[1]
             if d_header[0]:
                 org = values.get("org_name", "")
                 if "director" in keys:
@@ -1021,7 +1035,7 @@ QUICK_LOOKS = {  # вид оттиска: (потёртость, прерыви�
     "Слегка потёртая": (0.3, 0.1, 0.35, 0.95),
 }
 QUICK_COLORS = {"Синий": "#1f3fbf", "Фиолетовый": "#6a2fbf", "Чёрный": "#222222"}
-FROM_INN = {"org_name", "inn", "director", "director_short"}   # эти поля берутся из реестра
+FROM_INN = {"org_name", "inn", "director", "director_short", "director_nom", "operator"}  # из реестра/шапки
 
 
 def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color, header=None):
@@ -1036,20 +1050,18 @@ def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color, heade
             raise orgdata.OrgLookupError("Организация с таким ИНН не найдена.")
         det = orgdata.to_details(item)
         values["inn"] = det["inn"]
-        if det["type"] == "ИП":
-            values["org_name"] = det["short_name"]
-            sign_values["org_name"] = docgen.fio_short(det["manager"])
-        else:
-            values["org_name"] = det["short_name"]
-            sign_values["org_name"] = det["short_name"]
+        values["org_name"] = det["short_name"]
         if det["manager"]:
             values["director"] = docgen.fio_genitive(det["manager"])
             values["director_short"] = docgen.fio_short(det["manager"])
-            sign_values["director"] = docgen.fio_short(det["manager"])
+            values["director_nom"] = det["manager"]
+            sign_values["director"] = docgen.fio_short(det["manager"])   # для шаблонов со старой строкой подписи
+    if header:
+        values.setdefault("operator", header[1])
     sign_values = {k: v for k, v in sign_values.items() if k in sign_keys}
 
     docx_bytes = docgen.fill(tpl, values, sign_values=sign_values)
-    if header and header[0]:
+    if header and header[0] and "operator" not in docgen.scan(tpl):   # шапка уже есть в шаблоне
         _, to_line, title = header
         if det:
             frm = docgen.header_from(det["type"], det["short_name"], det["manager"], det["manager_post"])
@@ -1140,7 +1152,7 @@ with tab_quick:
         else:
             manual[k] = col.text_input(docgen.label(k), key=f"q_{k}", help=docgen.hint(k) or None)
 
-    q_header = header_ui("q")
+    q_header = header_ui("q", in_template="operator" in q_keys)
 
     # --- печать / подпись
     c1, c2, c3, c4 = st.columns(4)

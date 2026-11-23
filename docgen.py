@@ -24,10 +24,11 @@ TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templat
 
 # Встроенные шаблоны: файл → название
 BUILTIN = {
+    "OOOName.docx": "Согласие на наименование организации — юрлицо",
     "TZ.UL.docx": "Согласие на товарный знак — юрлицо",
     "TZ.IP.docx": "Согласие на товарный знак — ИП",
-    "TZ.Fiz.docx": "Согласие на товарный знак — физлицо",
     "Domen.UL.docx": "Согласие на доменное имя — юрлицо",
+    "Domen.IP.docx": "Согласие на доменное имя — ИП",
 }
 
 # Известные поля: имя → (подпись в форме, тип, подсказка)
@@ -38,6 +39,9 @@ KNOWN = {
     "director": ("ФИО руководителя", "text",
                  "Проверьте падеж: в шаблоне это поле может стоять после «в лице генерального директора»"),
     "director_short": ("Руководитель (И.О. Фамилия)", "text", ""),
+    "director_nom": ("ФИО руководителя внизу (именительный падеж)", "text",
+                     "Как в строке подписи, например: Петров Пётр Петрович"),
+    "operator": ("Кому (оператор связи)", "text", ""),
     "srok": ("Срок действия (до)", "date", ""),
     "data": ("Дата документа", "date", ""),
 }
@@ -377,7 +381,7 @@ def fill(data, values, extra=None, sign_values=None):
         return sv.get(m.group(1), ph(m))
 
     for p in _paragraphs(doc):
-        if _sign_paragraph(p):
+        if "data" in [m.group(1) for m in PLACEHOLDER_RE.finditer(p.text)]:
             _fix_sign_tabs(doc, p)
         _replace_in_paragraph(p, PLACEHOLDER_RE, ph_sign if sv and _sign_paragraph(p) else ph)
         for k, (rx, _, _) in MARKERS.items():
@@ -386,6 +390,7 @@ def fill(data, values, extra=None, sign_values=None):
                 if k == "__passport__" and not v.startswith("("):
                     v = f"({v})"
                 _replace_in_paragraph(p, rx, lambda m, v=v: v)
+        _replace_in_paragraph(p, re.compile(r"г\.\."), lambda m: "г.")   # «2027 г.» + точка шаблона
         for find, rep in (extra or []):
             if find:
                 _replace_in_paragraph(p, re.compile(re.escape(find)), lambda m, r=rep: r)
@@ -408,11 +413,31 @@ def soffice():
     return shutil.which("soffice") or shutil.which("libreoffice")
 
 
-def to_pdf(docx_bytes, timeout=120):
-    """Конвертирует .docx в PDF через LibreOffice. Возвращает байты PDF или None, если его нет."""
+# Шрифты Microsoft, которых нет на сервере → близкие по размерам свободные (только для PDF)
+PDF_FONT_SUBST = {"Aptos": "Carlito", "Aptos Display": "Carlito", "Aptos Narrow": "Carlito",
+                  "Calibri": "Carlito", "Calibri Light": "Carlito", "Cambria": "Caladea"}
+
+
+def _subst_fonts(docx_bytes):
+    """Копия документа с заменой отсутствующих шрифтов (тема и явно указанные)."""
+    import zipfile
+    src = zipfile.ZipFile(io.BytesIO(docx_bytes))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename.endswith(".xml") and (item.filename.startswith("word/theme/")
+                                                   or item.filename in ("word/document.xml", "word/styles.xml")):
+                text = data.decode("utf-8")
+                for a, b in PDF_FONT_SUBST.items():
+                    text = text.replace(f'typeface="{a}"', f'typeface="{b}"').replace(f'="{a}"', f'="{b}"')
+                data = text.encode("utf-8")
+            z.writestr(item, data)
+    return out.getvalue()
+
+
+def _convert(docx_bytes, timeout):
     exe = soffice()
-    if not exe:
-        return None
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "doc.docx")
         with open(src, "wb") as f:
@@ -426,6 +451,57 @@ def to_pdf(docx_bytes, timeout=120):
             raise RuntimeError("LibreOffice не смог сконвертировать документ в PDF")
         with open(out, "rb") as f:
             return f.read()
+
+
+def _pages(pdf_bytes):
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as d:
+        return len(d)
+
+
+def _drop_one_blank(docx_bytes):
+    """Удаляет один пустой абзац из самой длинной серии пустых строк в теле документа."""
+    doc = docx.Document(io.BytesIO(docx_bytes))
+    ps = doc.paragraphs
+    best, run = None, []
+    for p in ps + [None]:
+        if p is not None and not p.text.strip() and not p._p.xpath(".//w:drawing|.//w:br[@w:type='page']"):
+            run.append(p)
+            continue
+        if len(run) >= 3 and (best is None or len(run) > len(best)):
+            best = run
+        run = []
+    if not best:
+        return None
+    for p in best[-2:]:
+        p._p.getparent().remove(p._p)
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+def to_pdf(docx_bytes, timeout=120, one_page=True, max_tries=20):
+    """Конвертирует .docx в PDF через LibreOffice. Возвращает байты PDF или None, если его нет.
+    one_page=True: если исходник был на одну страницу «по задумке», а в PDF вылез на вторую
+    (из-за подмены шрифтов), — убирает лишние пустые строки, пока документ не поместится."""
+    if not soffice():
+        return None
+    work = _subst_fonts(docx_bytes)
+    pdf = _convert(work, timeout)
+    if not one_page:
+        return pdf
+    tries = 0
+    while _pages(pdf) > 1 and tries < max_tries:
+        smaller = _drop_one_blank(work)
+        if smaller is None:
+            break
+        work = smaller
+        tries += 1
+        pdf = _convert(work, timeout)
+    return pdf
 
 
 def signature_spot(pdf_bytes, needles):
