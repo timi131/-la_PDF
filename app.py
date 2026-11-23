@@ -804,6 +804,20 @@ def doc_lookup():
         f" · статус: {det['status']}" if det["status"] and det["status"] != "действующая" else "")
 
 
+def header_ui(prefix):
+    """Блок «Шапка документа». Возвращает (включена, кому, заголовок)."""
+    st.markdown("**Шапка документа**")
+    c1, c2, c3 = st.columns([0.8, 2, 1.4])
+    on = c1.checkbox("Добавить", True, key=prefix + "_hdr_on")
+    opts = docgen.OPERATORS + ["Свой вариант…"]
+    to = c2.selectbox("Кому", opts, key=prefix + "_hdr_to", disabled=not on)
+    if to == "Свой вариант…":
+        to = c2.text_input("Кому (свой текст)", key=prefix + "_hdr_to_own", disabled=not on,
+                           placeholder="Например: Оператору мобильной связи ПАО «МегаФон»")
+    title = c3.text_input("Заголовок", docgen.DEFAULT_TITLE, key=prefix + "_hdr_title", disabled=not on)
+    return on, to, title
+
+
 def decline_director(nom):
     """«Петров Пётр Петрович» → в тексте «Петрова Петра Петровича», в подписи «П.П. Петров»."""
     ss.doc_f_director = docgen.fio_genitive(nom)
@@ -892,6 +906,21 @@ with tab_docs:
                         help="Если оставить пустым — будет то же, что и в тексте. "
                              "Для руководителя обычно «И.О. Фамилия».")
 
+            d_header = header_ui("doc")
+            if d_header[0]:
+                org = values.get("org_name", "")
+                if "director" in keys:
+                    gen = values.get("director", "")
+                    auto = [f"От генерального директора {org}".strip(), gen]
+                elif "inn" in keys and org:   # ИП
+                    fio = org[3:].strip() if org.upper().startswith("ИП ") else org
+                    auto = ["От индивидуального предпринимателя", docgen.fio_genitive(fio)]
+                else:                          # физлицо
+                    auto = [f"От {docgen.fio_genitive(org)}"] if org else []
+                auto_txt = "\n".join(x for x in auto if x)
+                from_txt = st.text_area("От кого (каждая строка отдельно)", auto_txt, height=70,
+                                        key=f"doc_hdr_from_{abs(hash(auto_txt))}",
+                                        help="Заполняется автоматически из полей выше; можно поправить.")
             with st.expander("Дополнительные замены (необязательно)"):
                 extra_txt = st.text_area("Каждая строка: что найти => на что заменить", key="doc_extra",
                                          placeholder="ООО «ПРОМОДРАЙВ» => ООО «Другая компания»", height=90)
@@ -926,6 +955,10 @@ with tab_docs:
                 with st.spinner("Создание документа…"):
                     try:
                         docx_bytes = docgen.fill(tpl_data, values, extra, sign_values)
+                        if d_header[0]:
+                            docx_bytes = docgen.add_header(docx_bytes, d_header[1],
+                                                           [x for x in from_txt.splitlines() if x.strip()],
+                                                           d_header[2])
                         pdf_bytes = docgen.to_pdf(docx_bytes) if docgen.soffice() else None
                         signed = None
                         if pdf_bytes and put:
@@ -991,7 +1024,7 @@ QUICK_COLORS = {"Синий": "#1f3fbf", "Фиолетовый": "#6a2fbf", "Ч�
 FROM_INN = {"org_name", "inn", "director", "director_short"}   # эти поля берутся из реестра
 
 
-def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color):
+def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color, header=None):
     """Ищет организацию по ИНН, заполняет шаблон, делает печать/подпись и PDF."""
     with open(os.path.join(docgen.TEMPLATE_DIR, tpl_file), "rb") as fh:
         tpl = fh.read()
@@ -1016,6 +1049,13 @@ def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color):
     sign_values = {k: v for k, v in sign_values.items() if k in sign_keys}
 
     docx_bytes = docgen.fill(tpl, values, sign_values=sign_values)
+    if header and header[0]:
+        _, to_line, title = header
+        if det:
+            frm = docgen.header_from(det["type"], det["short_name"], det["manager"], det["manager_post"])
+        else:
+            frm = docgen.header_from("ФЛ", fio=values.get("org_name", ""))
+        docx_bytes = docgen.add_header(docx_bytes, to_line, frm, title)
     stamp_png = sign_png = None
     if det and want_stamp:
         f = orgdata.stamp_fields(det)
@@ -1100,6 +1140,8 @@ with tab_quick:
         else:
             manual[k] = col.text_input(docgen.label(k), key=f"q_{k}", help=docgen.hint(k) or None)
 
+    q_header = header_ui("q")
+
     # --- печать / подпись
     c1, c2, c3, c4 = st.columns(4)
     want_stamp = c1.checkbox("Поставить печать", True, key="q_stamp", disabled=is_person)
@@ -1126,7 +1168,7 @@ with tab_quick:
         with st.spinner("Ищу организацию, заполняю шаблон, ставлю печать…"):
             try:
                 ss.q_result = quick_build(tpl_file, (inn or "").strip(), manual, want_stamp and not is_person,
-                                          want_sign and not is_person, look, color)
+                                          want_sign and not is_person, look, color, q_header)
                 ss.q_result["file"] = clean_name(
                     f"{os.path.splitext(tpl_file)[0]}_{(inn or manual.get('org_name', '')).strip()}_"
                     f"{today.strftime('%d.%m.%Y')}", "документ")

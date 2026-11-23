@@ -137,6 +137,92 @@ def fio_short(fio):
     return "".join(p[0].upper() + "." for p in parts[1:3]) + " " + parts[0]
 
 
+# ------------------------------------------------------------------ шапка документа
+OPERATORS = [
+    "Оператору мобильной связи ПАО «МегаФон»",
+    "Оператору мобильной связи ПАО «МТС»",
+    "Оператору мобильной связи ПАО «ВымпелКом» (Билайн)",
+    "Оператору мобильной связи ООО «Т2 Мобайл»",
+    "Операторам мобильной связи",
+]
+DEFAULT_TITLE = "Письмо – разрешение"
+
+
+def post_genitive(post):
+    """«ГЕНЕРАЛЬНЫЙ ДИРЕКТОР» → «генерального директора» (склоняем слова до первого существительного)."""
+    words = (post or "").lower().split()
+    out, done = [], False
+    for w in words:
+        if done:
+            out.append(w)
+            continue
+        if w.endswith(("ый", "ой")):
+            out.append(w[:-2] + "ого")
+        elif w.endswith("ий"):
+            out.append(w[:-2] + ("его" if w[-3:-2] in "жшщчн" else "ого"))
+        else:
+            if w.endswith("ь"):
+                out.append(w[:-1] + "я")
+            elif w[-1:] in "бвгджзклмнпрстфхцчшщ":
+                out.append(w + "а")
+            else:
+                out.append(w)
+            done = True
+    return " ".join(out)
+
+
+def header_from(kind, org_name="", fio="", post=""):
+    """Строки «От кого». kind: "ЮЛ" | "ИП" | "ФЛ"."""
+    if kind == "ЮЛ":
+        p = post_genitive(post or "генеральный директор")
+        return [f"От {p} {org_name}".strip(), fio_genitive(fio)] if fio else [f"От {p} {org_name}".strip()]
+    if kind == "ИП":
+        return ["От индивидуального предпринимателя", fio_genitive(fio)]
+    return [f"От {fio_genitive(fio)}"]
+
+
+def add_header(data, to_line, from_lines, title=DEFAULT_TITLE):
+    """Вписывает шапку («Кому», «От кого», заголовок) в пустые строки перед текстом документа.
+    Если пустых строк не хватает — добавляет новые."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt
+    doc = docx.Document(io.BytesIO(data))
+    ps = doc.paragraphs
+    first = next((i for i, p in enumerate(ps) if p.text.strip()), len(ps))
+    sec = doc.sections[0]
+    half = int((sec.page_width - sec.left_margin - sec.right_margin) * 0.5)
+    right = [ln for ln in [to_line] + list(from_lines) if ln and ln.strip()]
+    plan = [("right", ln) for ln in right]
+    if title:
+        plan += [("blank", ""), ("blank", ""), ("title", title), ("blank", "")]
+    body = ps[first] if first < len(ps) else None
+    empties = ps[:first]
+    # не хватает пустых строк — вставляем новые перед текстом
+    while len(empties) < len(plan):
+        if body is not None:
+            empties.append(body.insert_paragraph_before(""))
+        else:
+            empties.append(doc.add_paragraph(""))
+    # шапку — в начало, заголовок — прямо перед текстом
+    n_right = len(right)
+    slots = empties[:n_right] + empties[len(empties) - (len(plan) - n_right):]
+    for p, (kind, text) in zip(slots, plan):
+        if kind == "blank":
+            continue
+        run = p.add_run(text)
+        pf = p.paragraph_format
+        pf.space_after = Pt(0)
+        if kind == "right":
+            pf.left_indent = half
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        else:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run.bold = True
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
 # ------------------------------------------------------------------ обход документа
 def _paragraphs(doc):
     """Все абзацы: тело, таблицы (в т.ч. вложенные), колонтитулы."""
