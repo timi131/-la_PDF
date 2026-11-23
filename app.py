@@ -63,8 +63,9 @@ def human_size(n):
 st.title("📄 PDF Объединитель")
 st.caption("PDF · JPG · PNG · BMP · GIF · TIFF · WEBP · TXT")
 
-tab_merge, tab_split, tab_edit, tab_stamp, tab_sign, tab_docs = st.tabs(
-    ["🔗 Объединить", "✂ Разделить", "✏ Редактор", "🔵 Печать", "✍ Подпись", "📄 Документы"])
+tab_quick, tab_merge, tab_split, tab_edit, tab_stamp, tab_sign, tab_docs = st.tabs(
+    ["⚡ Документ по ИНН", "🔗 Объединить", "✂ Разделить", "✏ Редактор", "🔵 Печать", "✍ Подпись",
+     "📄 Документы"])
 
 
 # ---------------------- общий блок «Поставить на PDF» (печать и/или подпись) ----------------------
@@ -492,21 +493,21 @@ def dadata_key():
     return ss.get("dadata_key") or orgdata.api_key()
 
 
-def save_user_key():
+def save_user_key(input_key="dadata_key_input", msg_key="key_msg"):
     """Проверяет введённый ключ тестовым запросом и сохраняет его только в этой сессии."""
-    key = (ss.get("dadata_key_input") or "").strip()
-    ss.pop("key_msg", None)
+    key = (ss.get(input_key) or "").strip()
+    ss.pop(msg_key, None)
     if not key:
-        ss.key_msg = ("error", "Вставьте ключ.")
+        ss[msg_key] = ("error", "Вставьте ключ.")
         return
     try:
         orgdata.find_by_inn("7707083893", key=key)   # тестовый запрос (ИНН ПАО Сбербанк)
     except orgdata.OrgLookupError as e:
-        ss.key_msg = ("error", str(e))
+        ss[msg_key] = ("error", str(e))
         return
     ss.dadata_key = key
-    ss.dadata_key_input = ""
-    ss.key_msg = ("success", "Ключ работает и сохранён до закрытия вкладки.")
+    ss[input_key] = ""
+    ss[msg_key] = ("success", "Ключ работает и сохранён до закрытия вкладки.")
 
 
 def forget_user_key():
@@ -978,3 +979,202 @@ with tab_docs:
                         st.download_button("⬇ Скачать PDF с печатью и подписью", res["signed"],
                                            res["name"] + "_подписано.pdf", "application/pdf",
                                            use_container_width=True, key="doc_dl_signed")
+
+
+# =============================== ⚡ ДОКУМЕНТ ПО ИНН (всё одной кнопкой) ===============================
+QUICK_LOOKS = {  # вид оттиска: (потёртость, прерывистость, нажим, непрозрачность)
+    "Обычный оттиск": (0.15, 0.0, 0.3, 0.95),
+    "Чистая печать": (0.0, 0.0, 0.0, 1.0),
+    "Слегка потёртая": (0.3, 0.1, 0.35, 0.95),
+}
+QUICK_COLORS = {"Синий": "#1f3fbf", "Фиолетовый": "#6a2fbf", "Чёрный": "#222222"}
+FROM_INN = {"org_name", "inn", "director", "director_short"}   # эти поля берутся из реестра
+
+
+def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color):
+    """Ищет организацию по ИНН, заполняет шаблон, делает печать/подпись и PDF."""
+    with open(os.path.join(docgen.TEMPLATE_DIR, tpl_file), "rb") as fh:
+        tpl = fh.read()
+    sign_keys = docgen.sign_line_keys(tpl)
+    values, sign_values, det = dict(manual), {}, None
+    if inn:
+        item = orgdata.find_by_inn(inn, key=dadata_key())
+        if not item:
+            raise orgdata.OrgLookupError("Организация с таким ИНН не найдена.")
+        det = orgdata.to_details(item)
+        values["inn"] = det["inn"]
+        if det["type"] == "ИП":
+            values["org_name"] = det["short_name"]
+            sign_values["org_name"] = docgen.fio_short(det["manager"])
+        else:
+            values["org_name"] = det["short_name"]
+            sign_values["org_name"] = det["short_name"]
+        if det["manager"]:
+            values["director"] = docgen.fio_genitive(det["manager"])
+            values["director_short"] = docgen.fio_short(det["manager"])
+            sign_values["director"] = docgen.fio_short(det["manager"])
+    sign_values = {k: v for k, v in sign_values.items() if k in sign_keys}
+
+    docx_bytes = docgen.fill(tpl, values, sign_values=sign_values)
+    stamp_png = sign_png = None
+    if det and want_stamp:
+        f = orgdata.stamp_fields(det)
+        w, b, u, op = QUICK_LOOKS[look]
+        stamp_png = stp.to_png_bytes(stp.round_stamp(
+            outer_text=f["outer"], inner_text=f["inner"], center_lines=(f["center"],),
+            color=color, wear=w, breaks=b, uneven=u, opacity=op, size=600, seed=int(det["inn"][-3:])))
+    if det and want_sign and det["manager"]:
+        sign_png = sgn.to_png_bytes(sgn.signature_from_text(
+            orgdata.signature_text(det), seed=int(det["inn"][-3:]) % 999 + 1))
+
+    pdf_bytes = signed = None
+    if docgen.soffice():
+        pdf_bytes = docgen.to_pdf(docx_bytes)
+        imgs = [("stamp", stamp_png), ("sign", sign_png)]
+        imgs = [(k, v) for k, v in imgs if v]
+        if imgs:
+            needles = [sign_values.get(k) or values.get(k) for k in sign_keys] + [values.get("data")]
+            spot = docgen.signature_spot(pdf_bytes, needles)
+            if spot:
+                pno, x0, yc, x1, pw, ph = spot
+                pos = {"sign": ((x1 + 75) / pw, (yc - 6) / ph), "stamp": (0.5, (yc - 25) / ph)}
+                pages = [pno]
+            else:
+                pos = {"sign": (0.45, 0.85), "stamp": (0.55, 0.83)}
+                pages = None
+            src_pdf = os.path.join(ss.tmp, "quick_src.pdf")
+            with open(src_pdf, "wb") as fh:
+                fh.write(pdf_bytes)
+            out = stp.apply_images(src_pdf, [{"png": v, "x": pos[k][0], "y": pos[k][1], "width_mm": 40}
+                                             for k, v in imgs], os.path.join(ss.tmp, "quick_signed"), pages)
+            with open(out, "rb") as fh:
+                signed = fh.read()
+    return {"det": det, "docx": docx_bytes, "pdf": pdf_bytes, "signed": signed,
+            "stamp": stamp_png, "sign": sign_png, "left": docgen.leftovers(docx_bytes)}
+
+
+with tab_quick:
+    st.markdown("Выберите шаблон, введите ИНН — получите готовый документ с печатью организации.")
+
+    # --- ключ DaData (если ещё не задан)
+    if not dadata_key():
+        with st.container(border=True):
+            st.markdown("🔑 **Нужен ключ DaData** — бесплатно на [dadata.ru](https://dadata.ru): "
+                        "«Профиль» → «API-ключ». Вводится один раз за сеанс.")
+            c1, c2 = st.columns([2, 1])
+            c1.text_input("API-ключ DaData", key="q_key_input", type="password",
+                          placeholder="Вставьте API-ключ DaData", label_visibility="collapsed")
+            c2.button("Сохранить ключ", key="q_key_save", on_click=save_user_key,
+                      args=("q_key_input", "q_key_msg"), use_container_width=True)
+            if ss.get("q_key_msg"):
+                kind_, text_ = ss.q_key_msg
+                getattr(st, kind_)(text_)
+
+    files = [f for f in docgen.BUILTIN if os.path.exists(os.path.join(docgen.TEMPLATE_DIR, f))]
+    c1, c2 = st.columns([1.3, 1])
+    tpl_file = c1.selectbox("Шаблон", files, format_func=lambda x: docgen.BUILTIN[x], key="q_tpl")
+    with open(os.path.join(docgen.TEMPLATE_DIR, tpl_file), "rb") as fh:
+        q_keys = docgen.scan(fh.read())
+    needs_inn = "inn" in q_keys
+    is_person = not needs_inn          # шаблон для физлица — у физлица нет печати и записи в ЕГРЮЛ
+    inn = ""
+    if needs_inn:
+        inn = c2.text_input("ИНН организации или ИП", key="q_inn", placeholder="10 или 12 цифр")
+    manual = {}
+    if is_person:
+        manual["org_name"] = c2.text_input("ФИО физлица", key="q_fio", placeholder="Иванов Иван Иванович")
+
+    # --- поля, которых нет в реестре
+    today = dt.date.today()
+    rest = [k for k in q_keys if k not in FROM_INN]
+    cols = st.columns(3)
+    date_fmt = cols[0].selectbox("Формат дат", list(docgen.DATE_FORMATS), key="q_date_fmt")
+    i = 1
+    for k in rest:
+        col = cols[i % 3]
+        i += 1
+        if docgen.field_type(k) == "date":
+            default = today if k == "data" else today.replace(year=today.year + 1)
+            manual[k] = docgen.format_date(col.date_input(docgen.label(k), default, key=f"q_{k}",
+                                                          format="DD.MM.YYYY"), date_fmt)
+        else:
+            manual[k] = col.text_input(docgen.label(k), key=f"q_{k}", help=docgen.hint(k) or None)
+
+    # --- печать / подпись
+    c1, c2, c3, c4 = st.columns(4)
+    want_stamp = c1.checkbox("Поставить печать", True, key="q_stamp", disabled=is_person)
+    want_sign = c2.checkbox("Поставить подпись", False, key="q_sign", disabled=is_person,
+                            help="Подпись руководителя («И. Фамилия») рукописным шрифтом")
+    look = c3.selectbox("Вид оттиска", list(QUICK_LOOKS), key="q_look", disabled=not want_stamp)
+    color = QUICK_COLORS[c4.selectbox("Цвет", list(QUICK_COLORS), key="q_color", disabled=not want_stamp)]
+
+    problems = []
+    if needs_inn and not dadata_key():
+        problems.append("сохраните ключ DaData")
+    if needs_inn and not orgdata.inn_is_valid((inn or "").strip()):
+        problems.append("введите правильный ИНН")
+    if is_person and not manual.get("org_name", "").strip():
+        problems.append("введите ФИО")
+    empty = [docgen.label(k) for k in rest if not str(manual.get(k, "")).strip()]
+    if empty:
+        problems.append("заполните: " + ", ".join(empty))
+    if problems:
+        st.caption("Чтобы сформировать документ: " + "; ".join(problems) + ".")
+
+    if st.button("⚡ Сформировать документ", type="primary", use_container_width=True,
+                 disabled=bool(problems), key="q_go"):
+        with st.spinner("Ищу организацию, заполняю шаблон, ставлю печать…"):
+            try:
+                ss.q_result = quick_build(tpl_file, (inn or "").strip(), manual, want_stamp and not is_person,
+                                          want_sign and not is_person, look, color)
+                ss.q_result["file"] = clean_name(
+                    f"{os.path.splitext(tpl_file)[0]}_{(inn or manual.get('org_name', '')).strip()}_"
+                    f"{today.strftime('%d.%m.%Y')}", "документ")
+            except orgdata.OrgLookupError as e:
+                ss.pop("q_result", None)
+                st.error(str(e))
+            except Exception as e:
+                ss.pop("q_result", None)
+                st.error(f"Ошибка: {e}")
+
+    res = ss.get("q_result")
+    if res:
+        det = res["det"]
+        if det:
+            if det["status"] and det["status"] != "действующая":
+                st.warning(f"Внимание: организация {det['status']}.")
+            tpl_is_ip = tpl_file.split(".")[1] == "IP" if tpl_file.count(".") > 1 else False
+            if (det["type"] == "ИП") != tpl_is_ip and needs_inn:
+                st.warning("Похоже, шаблон не подходит: ИНН принадлежит "
+                           + ("ИП" if det["type"] == "ИП" else "организации")
+                           + ", а выбран шаблон для " + ("ИП." if tpl_is_ip else "юрлица."))
+            st.success(f"**{det['short_name']}** · ИНН {det['inn']} · {det['address']}"
+                       + (f"  \n{det['manager_post']}: {det['manager']}" if det["manager"] else ""))
+        if res["left"]:
+            st.warning("Остались незаполненные места: " + ", ".join(res["left"]))
+        pc1, pc2 = st.columns([1, 1.2])
+        show = res["signed"] or res["pdf"]
+        if show:
+            pv = pe.fitz.open(stream=show, filetype="pdf")
+            pc1.image(pv[len(pv) - 1].get_pixmap(dpi=80).tobytes("png"), use_container_width=True,
+                      caption="Предпросмотр")
+            pv.close()
+        with pc2:
+            name = res["file"]
+            if res["signed"]:
+                st.download_button("⬇ Скачать PDF с печатью", res["signed"], name + ".pdf",
+                                   "application/pdf", type="primary", use_container_width=True, key="q_dl1")
+            elif res["pdf"]:
+                st.download_button("⬇ Скачать PDF", res["pdf"], name + ".pdf", "application/pdf",
+                                   type="primary", use_container_width=True, key="q_dl2")
+            else:
+                st.caption("PDF недоступен: на сервере нет LibreOffice.")
+            st.download_button("⬇ Скачать DOCX (Word, без печати)", res["docx"], name + ".docx",
+                               "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                               use_container_width=True, key="q_dl3")
+            if res["stamp"]:
+                st.download_button("⬇ Скачать печать (PNG)", res["stamp"], "печать.png", "image/png",
+                                   use_container_width=True, key="q_dl4")
+            if res["sign"]:
+                st.download_button("⬇ Скачать подпись (PNG)", res["sign"], "подпись.png", "image/png",
+                                   use_container_width=True, key="q_dl5")
