@@ -17,6 +17,9 @@ import zipfile
 import streamlit as st
 
 import pdf_edit as pe
+import datetime as dt
+
+import docgen
 import orgdata
 import signature as sgn
 import stamp as stp
@@ -60,8 +63,8 @@ def human_size(n):
 st.title("📄 PDF Объединитель")
 st.caption("PDF · JPG · PNG · BMP · GIF · TIFF · WEBP · TXT")
 
-tab_merge, tab_split, tab_edit, tab_stamp, tab_sign = st.tabs(
-    ["🔗 Объединить", "✂ Разделить", "✏ Редактор", "🔵 Печать", "✍ Подпись"])
+tab_merge, tab_split, tab_edit, tab_stamp, tab_sign, tab_docs = st.tabs(
+    ["🔗 Объединить", "✂ Разделить", "✏ Редактор", "🔵 Печать", "✍ Подпись", "📄 Документы"])
 
 
 # ---------------------- общий блок «Поставить на PDF» (печать и/или подпись) ----------------------
@@ -523,7 +526,11 @@ def org_lookup():
     if not item:
         ss.org_error = "Организация с таким ИНН не найдена."
         return
-    det = orgdata.to_details(item)
+    apply_org(orgdata.to_details(item))
+
+
+def apply_org(det):
+    """Подставляет реквизиты организации сразу везде: печать, подпись, поля документов."""
     f = orgdata.stamp_fields(det)
     ss.st_kind = "Круглая печать"
     ss.st_outer, ss.st_inner, ss.st_center, ss.st_bottom = f["outer"], f["inner"], f["center"], ""
@@ -531,6 +538,13 @@ def org_lookup():
     if sig:
         ss.sg_text = sig
     ss.org_details = det
+    ss.doc_f_org_name = det["short_name"]
+    ss.doc_f_inn = det["inn"]
+    ss.doc_sign_org_name = det["short_name"]
+    if det["manager"]:
+        ss.doc_f_director = docgen.fio_genitive(det["manager"])
+        ss.doc_sign_director = docgen.fio_short(det["manager"])
+        ss.doc_f_director_short = docgen.fio_short(det["manager"])
 
 
 with tab_stamp:
@@ -769,3 +783,198 @@ with tab_sign:
             st.info("Здесь появится подпись.")
     st.divider()
     place_on_pdf_ui("pl_sign", "sign")
+
+
+# =============================== ДОКУМЕНТЫ ПО ШАБЛОНАМ ===============================
+def doc_lookup():
+    """Заполняет поля документа по ИНН через DaData."""
+    ss.pop("doc_org_error", None)
+    try:
+        item = orgdata.find_by_inn(ss.get("doc_inn", ""), key=dadata_key())
+    except orgdata.OrgLookupError as e:
+        ss.doc_org_error = str(e)
+        return
+    if not item:
+        ss.doc_org_error = "Организация с таким ИНН не найдена."
+        return
+    det = orgdata.to_details(item)
+    apply_org(det)
+    ss.doc_org_ok = f"Заполнено: {det['short_name']}" + (
+        f" · статус: {det['status']}" if det["status"] and det["status"] != "действующая" else "")
+
+
+def decline_director(nom):
+    """«Петров Пётр Петрович» → в тексте «Петрова Петра Петровича», в подписи «П.П. Петров»."""
+    ss.doc_f_director = docgen.fio_genitive(nom)
+    ss.doc_sign_director = docgen.fio_short(nom)
+
+
+with tab_docs:
+    st.caption("Шаблоны Word (.docx) с полями вида {{org_name}}, {{inn}}, {{director}}, {{srok}}, {{data}}. "
+               "Заглушки «ХХХХХХ», «ХХХХХХ.ru» и подсказка про паспортные данные тоже заполняются.")
+    c1, c2 = st.columns([1, 2])
+    src = c1.radio("Шаблон", ["Встроенный", "Свой файл .docx"], key="doc_src")
+    tpl_name, tpl_data = None, None
+    if src == "Встроенный":
+        files = [f for f in docgen.BUILTIN if os.path.exists(os.path.join(docgen.TEMPLATE_DIR, f))]
+        if files:
+            f = c2.selectbox("Документ", files, format_func=lambda x: docgen.BUILTIN[x], key="doc_builtin")
+            tpl_name = os.path.splitext(f)[0]
+            with open(os.path.join(docgen.TEMPLATE_DIR, f), "rb") as fh:
+                tpl_data = fh.read()
+        else:
+            c2.warning("Встроенные шаблоны не найдены в папке templates/.")
+    else:
+        up = c2.file_uploader("Шаблон .docx", type=["docx"], key="doc_upload")
+        if up:
+            tpl_name, tpl_data = os.path.splitext(up.name)[0], up.getvalue()
+
+    if tpl_data:
+        try:
+            keys = docgen.scan(tpl_data)
+            sign_keys = docgen.sign_line_keys(tpl_data)
+        except Exception as e:
+            st.error(f"Не удалось прочитать шаблон: {e}")
+            keys = None
+        if keys is not None and not keys:
+            st.warning("В шаблоне не найдено полей {{…}} — заполнять нечего. "
+                       "Добавьте в Word поля вида {{org_name}}, {{inn}}, {{data}}.")
+        elif keys:
+            # --- автозаполнение по ИНН
+            if any(k in keys for k in ("org_name", "inn", "director")):
+                with st.expander("🔎 Заполнить по ИНН (DaData)", expanded=False):
+                    has_key = bool(dadata_key())
+                    if not has_key:
+                        st.info("Сначала сохраните ключ DaData на вкладке «🔵 Печать» "
+                                "(блок «Заполнить реквизиты по ИНН») или задайте DADATA_API_KEY на сервере.")
+                    c1, c2 = st.columns([2, 1])
+                    c1.text_input("ИНН", key="doc_inn", placeholder="10 цифр — организация, 12 — ИП",
+                                  label_visibility="collapsed", disabled=not has_key)
+                    c2.button("Найти и заполнить", key="doc_find", on_click=doc_lookup,
+                              use_container_width=True, disabled=not has_key)
+                    if ss.get("doc_org_error"):
+                        st.error(ss.doc_org_error)
+                    elif ss.get("doc_org_ok"):
+                        st.success(ss.doc_org_ok + " — проверьте поля ниже, особенно падеж ФИО. "
+                                   "Печать и подпись тоже обновлены по этим реквизитам.")
+
+            st.markdown("**Поля документа**")
+            today = dt.date.today()
+            date_fmt = st.selectbox("Формат дат", list(docgen.DATE_FORMATS), key="doc_date_fmt")
+            values, sign_values = {}, {}
+            cols = st.columns(2)
+            for i, k in enumerate(keys):
+                col = cols[i % 2]
+                lab, h = docgen.label(k), docgen.hint(k) or None
+                if docgen.field_type(k) == "date":
+                    default = today if k == "data" else today.replace(year=today.year + 1)
+                    d = col.date_input(lab, default, key=f"doc_f_{k}", format="DD.MM.YYYY", help=h)
+                    values[k] = docgen.format_date(d, date_fmt)
+                else:
+                    if k == "director" and "director" in sign_keys:
+                        lab = "ФИО руководителя в тексте (родительный падеж)"
+                        h = "Как после слов «в лице генерального директора …», например: Петрова Петра Петровича"
+                    values[k] = col.text_input(lab, key=f"doc_f_{k}", help=h)
+                    if k == "director" and values[k]:
+                        col.caption("Нужен родительный падеж. Можно ввести ФИО в обычной форме "
+                                    "и нажать кнопку ниже.")
+                        col.button("Просклонять ФИО", key="doc_decline", on_click=decline_director,
+                                   args=(values[k],))
+            # строка подписи
+            if sign_keys:
+                st.markdown("**Строка подписи** (внизу документа)")
+                cols = st.columns(len(sign_keys))
+                for col, k in zip(cols, sign_keys):
+                    sign_values[k] = col.text_input(
+                        f"{docgen.label(k)} — в строке подписи", key=f"doc_sign_{k}",
+                        placeholder=values.get(k, ""),
+                        help="Если оставить пустым — будет то же, что и в тексте. "
+                             "Для руководителя обычно «И.О. Фамилия».")
+
+            with st.expander("Дополнительные замены (необязательно)"):
+                extra_txt = st.text_area("Каждая строка: что найти => на что заменить", key="doc_extra",
+                                         placeholder="ООО «ПРОМОДРАЙВ» => ООО «Другая компания»", height=90)
+            extra = []
+            for line in (extra_txt or "").splitlines():
+                if "=>" in line:
+                    a_, b_ = line.split("=>", 1)
+                    if a_.strip():
+                        extra.append((a_.strip(), b_.strip()))
+
+            empty = [docgen.label(k) for k in keys if not str(values.get(k, "")).strip()]
+            if empty:
+                st.warning("Не заполнено: " + ", ".join(empty))
+
+            st.markdown("**Печать и подпись**")
+            have = [k for k in ("stamp", "sign") if ss.get("png_" + k)]
+            if not docgen.soffice():
+                st.caption("PDF недоступен: на сервере нет LibreOffice — будет только DOCX.")
+                put = []
+            elif have:
+                names = {"stamp": "печать (вкладка «🔵 Печать»)", "sign": "подпись (вкладка «✍ Подпись»)"}
+                put = st.multiselect("Поставить в PDF у строки подписи", have, default=have,
+                                     format_func=lambda k: names[k], key="doc_put")
+            else:
+                st.caption("Чтобы в PDF сразу стояли печать и подпись, сначала создайте их "
+                           "на вкладках «🔵 Печать» и «✍ Подпись».")
+                put = []
+
+            out_name = clean_name(st.text_input("Имя файла", f"{tpl_name}_{today.strftime('%d.%m.%Y')}",
+                                                key="doc_out_name"), "документ")
+            if st.button("Создать документ", type="primary", use_container_width=True, key="doc_go"):
+                with st.spinner("Создание документа…"):
+                    try:
+                        docx_bytes = docgen.fill(tpl_data, values, extra, sign_values)
+                        pdf_bytes = docgen.to_pdf(docx_bytes) if docgen.soffice() else None
+                        signed = None
+                        if pdf_bytes and put:
+                            needles = [sign_values.get(k) or values.get(k) for k in sign_keys] + [values.get("data")]
+                            spot = docgen.signature_spot(pdf_bytes, needles)
+                            src_pdf = os.path.join(ss.tmp, "doc_src.pdf")
+                            with open(src_pdf, "wb") as fh:
+                                fh.write(pdf_bytes)
+                            if spot:
+                                pno, x0, yc, x1, pw, ph = spot
+                                # подпись — сразу справа от ФИО, печать — по центру строки, чуть выше
+                                pos = {"sign": ((x1 + 75) / pw, (yc - 6) / ph, 40),
+                                       "stamp": (0.5, (yc - 25) / ph, 40)}
+                                pages = [pno]
+                            else:
+                                pos = {"sign": (0.45, 0.85, 40), "stamp": (0.55, 0.83, 40)}
+                                pages = None
+                            items = [{"png": ss["png_" + k], "x": pos[k][0], "y": pos[k][1],
+                                      "width_mm": pos[k][2]} for k in ("stamp", "sign") if k in put]
+                            out_pdf = stp.apply_images(src_pdf, items, os.path.join(ss.tmp, "doc_signed"),
+                                                       pages=pages)
+                            with open(out_pdf, "rb") as fh:
+                                signed = fh.read()
+                        ss.doc_result = {"name": out_name, "docx": docx_bytes, "pdf": pdf_bytes,
+                                         "signed": signed, "left": docgen.leftovers(docx_bytes)}
+                    except Exception as e:
+                        st.error(f"Ошибка: {e}")
+                        ss.pop("doc_result", None)
+
+            res = ss.get("doc_result")
+            if res:
+                if res["left"]:
+                    st.warning("В документе остались незаполненные места: " + ", ".join(res["left"]))
+                else:
+                    st.success("Документ готов.")
+                show = res["signed"] or res["pdf"]
+                pc1, pc2 = st.columns([1, 1.2])
+                if show:
+                    pv = pe.fitz.open(stream=show, filetype="pdf")
+                    pc1.image(pv[len(pv) - 1].get_pixmap(dpi=80).tobytes("png"),
+                              caption="Предпросмотр (последняя страница)", use_container_width=True)
+                    pv.close()
+                with pc2:
+                    st.download_button("⬇ Скачать DOCX (Word)", res["docx"], res["name"] + ".docx",
+                                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                       use_container_width=True, key="doc_dl_docx")
+                    if res["pdf"]:
+                        st.download_button("⬇ Скачать PDF", res["pdf"], res["name"] + ".pdf",
+                                           "application/pdf", use_container_width=True, key="doc_dl_pdf")
+                    if res["signed"]:
+                        st.download_button("⬇ Скачать PDF с печатью и подписью", res["signed"],
+                                           res["name"] + "_подписано.pdf", "application/pdf",
+                                           use_container_width=True, key="doc_dl_signed")

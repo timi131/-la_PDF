@@ -1,10 +1,12 @@
 FROM python:3.12-slim
 
-# шрифт с кириллицей — для водяного знака и номеров страниц
-# (если apt недоступен, сборка не падает — просто будет шрифт без кириллицы)
+# шрифты с кириллицей — для водяного знака, номеров страниц и документов;
+# LibreOffice Writer — для превращения документов Word (.docx) в PDF.
+# Если apt недоступен, сборка не падает: документы будут только в DOCX.
 RUN (apt-get update \
-    && apt-get install -y --no-install-recommends fonts-dejavu-core \
-    && rm -rf /var/lib/apt/lists/*) || echo "WARNING: fonts-dejavu-core не установлен"
+    && apt-get install -y --no-install-recommends fonts-dejavu-core fonts-liberation2 \
+       fonts-crosextra-carlito libreoffice-writer-nogui \
+    && rm -rf /var/lib/apt/lists/*) || echo "WARNING: шрифты/LibreOffice не установлены"
 
 WORKDIR /app
 COPY requirements.txt .
