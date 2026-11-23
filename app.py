@@ -1038,7 +1038,8 @@ QUICK_COLORS = {"Синий": "#1f3fbf", "Фиолетовый": "#6a2fbf", "Ч�
 FROM_INN = {"org_name", "inn", "director", "director_short", "director_nom", "operator"}  # из реестра/шапки
 
 
-def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color, header=None):
+def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color, header=None,
+                stamp_options=None, sign_options=None, placement=None):
     """Ищет организацию по ИНН, заполняет шаблон, делает печать/подпись и PDF."""
     with open(os.path.join(docgen.TEMPLATE_DIR, tpl_file), "rb") as fh:
         tpl = fh.read()
@@ -1071,13 +1072,40 @@ def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color, heade
     stamp_png = sign_png = None
     if det and want_stamp:
         f = orgdata.stamp_fields(det)
-        w, b, u, op = QUICK_LOOKS[look]
+        opts = stamp_options or {}
+        w = opts.get("wear", QUICK_LOOKS[look][0])
+        b = opts.get("breaks", QUICK_LOOKS[look][1])
+        u = opts.get("uneven", QUICK_LOOKS[look][2])
+        op = opts.get("opacity", QUICK_LOOKS[look][3])
         stamp_png = stp.to_png_bytes(stp.round_stamp(
             outer_text=f["outer"], inner_text=f["inner"], center_lines=(f["center"],),
-            color=color, wear=w, breaks=b, uneven=u, opacity=op, size=600, seed=int(det["inn"][-3:])))
-    if det and want_sign and det["manager"]:
-        sign_png = sgn.to_png_bytes(sgn.signature_from_text(
-            orgdata.signature_text(det), seed=int(det["inn"][-3:]) % 999 + 1))
+            color=opts.get("color", color), wear=w, breaks=b, uneven=u, opacity=op,
+            rotation=opts.get("rotation", 0), border=opts.get("border", 2.2),
+            dashed=opts.get("dashed", False), size=600,
+            seed=opts.get("seed", int(det["inn"][-3:]))))
+    if det and want_sign:
+        opts = sign_options or {}
+        if opts.get("source") == "photo":
+            if opts.get("photo"):
+                photo_opts = opts["photo"]
+                sign_png = clean_photo_png(photo_opts["data"], tuple(sorted(dict(
+                    color=photo_opts["color"], keep_color=photo_opts["keep_color"],
+                    sensitivity=photo_opts["sensitivity"]).items())))
+        elif det["manager"]:
+            sign_text = opts.get("text") or orgdata.signature_text(det)
+            sign_png = sgn.to_png_bytes(sgn.signature_from_text(
+                sign_text,
+                font=opts.get("font", "Изящный (Marck Script)"),
+                flourish=opts.get("flourish", "underline"),
+                mode=opts.get("mode", "full"),
+                keep_letters=opts.get("keep_letters", 3),
+                color=opts.get("color", "#1b3fa8"),
+                slant=opts.get("slant", 12),
+                thickness=opts.get("thickness", 0.2),
+                jitter=opts.get("jitter", 0.35),
+                pressure=opts.get("pressure", 0.3),
+                seed=opts.get("seed", int(det["inn"][-3:]) % 999 + 1),
+                size=110))
 
     pdf_bytes = signed = None
     if docgen.soffice():
@@ -1089,15 +1117,22 @@ def quick_build(tpl_file, inn, manual, want_stamp, want_sign, look, color, heade
             spot = docgen.signature_spot(pdf_bytes, needles)
             if spot:
                 pno, x0, yc, x1, pw, ph = spot
-                pos = {"sign": ((x1 + 75) / pw, (yc - 6) / ph), "stamp": (0.5, (yc - 25) / ph)}
+                pos = {"sign": ((x1 + 75) / pw, (yc - 6) / ph),
+                       "stamp": (0.5, (yc - 25) / ph)}
                 pages = [pno]
             else:
                 pos = {"sign": (0.45, 0.85), "stamp": (0.55, 0.83)}
                 pages = None
+            if placement:
+                pos = {k: (placement[k]["x"], placement[k]["y"]) for k in pos if k in placement}
+                widths = placement
+            else:
+                widths = {"stamp": {"width_mm": 40}, "sign": {"width_mm": 40}}
             src_pdf = os.path.join(ss.tmp, "quick_src.pdf")
             with open(src_pdf, "wb") as fh:
                 fh.write(pdf_bytes)
-            out = stp.apply_images(src_pdf, [{"png": v, "x": pos[k][0], "y": pos[k][1], "width_mm": 40}
+            out = stp.apply_images(src_pdf, [{"png": v, "x": pos[k][0], "y": pos[k][1],
+                                              "width_mm": widths[k].get("width_mm", 40)}
                                              for k, v in imgs], os.path.join(ss.tmp, "quick_signed"), pages)
             with open(out, "rb") as fh:
                 signed = fh.read()
@@ -1162,6 +1197,107 @@ with tab_quick:
     look = c3.selectbox("Вид оттиска", list(QUICK_LOOKS), key="q_look", disabled=not want_stamp)
     color = QUICK_COLORS[c4.selectbox("Цвет", list(QUICK_COLORS), key="q_color", disabled=not want_stamp)]
 
+    stamp_options = None
+    if want_stamp and not is_person:
+        with st.expander("Настройки печати"):
+            c1, c2, c3 = st.columns(3)
+            border = c1.slider("Толщина рамки", 0.5, 5.0, 2.2, 0.1, key="q_stamp_border")
+            rotation = c2.slider("Наклон печати, °", -45, 45, 0, key="q_stamp_rotation")
+            dashed = c3.checkbox("Прерывистая рамка", False, key="q_stamp_dashed")
+            c1, c2 = st.columns(2)
+            wear = c1.slider("Потёртость печати", 0.0, 1.0, QUICK_LOOKS[look][0], 0.05,
+                             key="q_stamp_wear")
+            breaks = c2.slider("Прерывистость печати", 0.0, 1.0, QUICK_LOOKS[look][1], 0.05,
+                               key="q_stamp_breaks")
+            c1, c2, c3 = st.columns(3)
+            uneven = c1.slider("Неравномерный нажим", 0.0, 1.0, QUICK_LOOKS[look][2], 0.05,
+                               key="q_stamp_uneven")
+            transparency = c2.slider("Прозрачность печати, %", 0, 80, 5, 5,
+                                     key="q_stamp_transparency")
+            stamp_seed_default = max(1, int((inn or "0")[-3:] or "1"))
+            seed = c3.number_input("Номер узора печати", 1, 999,
+                                   stamp_seed_default, key="q_stamp_seed")
+            stamp_options = dict(wear=wear, breaks=breaks, uneven=uneven,
+                                 opacity=1 - transparency / 100, color=color,
+                                 border=border, rotation=rotation, dashed=dashed, seed=int(seed))
+
+    sign_options = None
+    if want_sign and not is_person:
+        with st.expander("Настройки подписи"):
+            sign_source = st.radio("Источник подписи", ["Автоматически по ИНН",
+                                                         "Из имени (своё)",
+                                                         "Из фото своей подписи"],
+                                   horizontal=True, key="q_sign_source")
+            sign_options = {"source": "photo" if sign_source == "Из фото своей подписи" else "text"}
+            if sign_source == "Из фото своей подписи":
+                photo = st.file_uploader("Фото или скан своей подписи",
+                                         type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
+                                         key="q_sign_photo")
+                c1, c2 = st.columns(2)
+                sensitivity = c1.slider("Чувствительность", 0.0, 1.0, 0.5, 0.05,
+                                        key="q_sign_sensitivity")
+                keep_color = c2.checkbox("Оставить исходный цвет", False, key="q_sign_keep_color")
+                preset = c2.selectbox("Цвет чернил", ["Синий", "Тёмно-синий", "Фиолетовый", "Чёрный"],
+                                      key="q_sign_color", disabled=keep_color)
+                colors = {"Синий": "#1b3fa8", "Тёмно-синий": "#1b2a6f",
+                          "Фиолетовый": "#4b2a9f", "Чёрный": "#1a1a1a"}
+                if photo:
+                    sign_options["photo"] = {"data": photo.getvalue(), "keep_color": keep_color,
+                                             "sensitivity": sensitivity, "color": colors[preset]}
+                else:
+                    st.caption("Загрузите фото подписи или выберите другой источник.")
+            else:
+                sign_text = None
+                if sign_source == "Из имени (своё)":
+                    sign_text = st.text_input("Текст подписи", "Иванов",
+                                              key="q_sign_text")
+                c1, c2 = st.columns(2)
+                font = c1.selectbox("Почерк", list(sgn.FONTS), key="q_sign_font")
+                flourish_name = c2.selectbox("Росчерк", list(sgn.FLOURISHES),
+                                             index=1, key="q_sign_flourish")
+                c1, c2 = st.columns(2)
+                mode = c1.radio("Написание", ["Полностью", "Первые буквы + росчерк"],
+                                horizontal=True, key="q_sign_mode")
+                keep_letters = c2.slider("Сколько букв оставить", 1, 6, 3,
+                                         disabled=mode == "Полностью", key="q_sign_keep")
+                c1, c2, c3 = st.columns(3)
+                sign_preset = c1.selectbox("Цвет чернил", ["Синий", "Тёмно-синий", "Фиолетовый", "Чёрный"],
+                                           key="q_sign_text_preset")
+                sign_colors = {"Синий": "#1b3fa8", "Тёмно-синий": "#1b2a6f",
+                               "Фиолетовый": "#4b2a9f", "Чёрный": "#1a1a1a"}
+                slant = c2.slider("Наклон, °", -10, 35, 12, key="q_sign_slant")
+                thickness = c3.slider("Толщина", 0.0, 1.0, 0.2, 0.05, key="q_sign_thickness")
+                c1, c2, c3 = st.columns(3)
+                jitter = c1.slider("Живость руки", 0.0, 1.0, 0.35, 0.05, key="q_sign_jitter")
+                pressure = c2.slider("Неровный нажим", 0.0, 1.0, 0.3, 0.05, key="q_sign_pressure")
+                sign_seed = c3.number_input("Номер варианта", 1, 999, 1, key="q_sign_seed")
+                sign_options.update(text=sign_text,
+                                    font=font, flourish=sgn.FLOURISHES[flourish_name],
+                                    mode="full" if mode == "Полностью" else "short",
+                                    keep_letters=keep_letters, color=sign_colors[sign_preset],
+                                    slant=slant, thickness=thickness, jitter=jitter,
+                                    pressure=pressure, seed=int(sign_seed))
+
+    placement = None
+    if (want_stamp or want_sign) and not is_person:
+        with st.expander("Положение печати и подписи в документе"):
+            pc = st.columns(2)
+            placement = {}
+            if want_stamp:
+                with pc[0]:
+                    st.markdown("**Печать**")
+                    sx = st.slider("Печать: горизонтально, %", 0, 100, 55, key="q_stamp_x")
+                    sy = st.slider("Печать: вертикально, %", 0, 100, 58, key="q_stamp_y")
+                    sw = st.slider("Печать: ширина, мм", 15, 120, 40, key="q_stamp_width")
+                    placement["stamp"] = {"x": sx / 100, "y": sy / 100, "width_mm": sw}
+            if want_sign:
+                with pc[1]:
+                    st.markdown("**Подпись**")
+                    gx = st.slider("Подпись: горизонтально, %", 0, 100, 45, key="q_sign_x")
+                    gy = st.slider("Подпись: вертикально, %", 0, 100, 85, key="q_sign_y")
+                    gw = st.slider("Подпись: ширина, мм", 15, 120, 40, key="q_sign_width")
+                    placement["sign"] = {"x": gx / 100, "y": gy / 100, "width_mm": gw}
+
     problems = []
     if needs_inn and not dadata_key():
         problems.append("сохраните ключ DaData")
@@ -1180,7 +1316,8 @@ with tab_quick:
         with st.spinner("Ищу организацию, заполняю шаблон, ставлю печать…"):
             try:
                 ss.q_result = quick_build(tpl_file, (inn or "").strip(), manual, want_stamp and not is_person,
-                                          want_sign and not is_person, look, color, q_header)
+                                          want_sign and not is_person, look, color, q_header,
+                                          stamp_options, sign_options, placement)
                 ss.q_result["file"] = clean_name(
                     f"{os.path.splitext(tpl_file)[0]}_{(inn or manual.get('org_name', '')).strip()}_"
                     f"{today.strftime('%d.%m.%Y')}", "документ")
@@ -1216,7 +1353,8 @@ with tab_quick:
         with pc2:
             name = res["file"]
             if res["signed"]:
-                st.download_button("⬇ Скачать PDF с печатью", res["signed"], name + ".pdf",
+                st.download_button("⬇ Скачать PDF с печатью и подписью" if res["sign"] else "⬇ Скачать PDF с печатью",
+                                   res["signed"], name + ".pdf",
                                    "application/pdf", type="primary", use_container_width=True, key="q_dl1")
             elif res["pdf"]:
                 st.download_button("⬇ Скачать PDF", res["pdf"], name + ".pdf", "application/pdf",
