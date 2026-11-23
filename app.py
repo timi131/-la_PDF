@@ -558,7 +558,7 @@ with tab_stamp:
             c2.button("Забыть ключ", on_click=forget_user_key, use_container_width=True)
         else:
             if orgdata.api_key():
-                st.caption("🔑 Ключ DaData задан на сервере. При желании можно указать свой ниже.")
+                st.caption("🔑 Ключ DaData уже подключён. При желании можно указать свой ниже.")
             else:
                 st.info("Для поиска нужен бесплатный ключ DaData: зарегистрируйтесь на "
                         "[dadata.ru](https://dadata.ru), откройте «Профиль» и скопируйте «API-ключ».")

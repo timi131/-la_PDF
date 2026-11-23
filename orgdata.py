@@ -19,8 +19,13 @@ class OrgLookupError(Exception):
     pass
 
 
+# Встроенный ключ (по просьбе владельца). Переменная окружения DADATA_API_KEY имеет приоритет.
+# ВНИМАНИЕ: репозиторий публичный — при утечке выпустите новый ключ в личном кабинете DaData.
+BUILTIN_KEY = "5c4af1b9ea282edee0e5bdd730a0d220632d5af4"
+
+
 def api_key():
-    return os.environ.get("DADATA_API_KEY", "").strip()
+    return os.environ.get("DADATA_API_KEY", "").strip() or BUILTIN_KEY
 
 
 def inn_is_valid(inn):
